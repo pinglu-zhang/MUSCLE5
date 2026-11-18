@@ -886,6 +886,9 @@
     <ClInclude Include="best3.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="hmmrolling.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="hmmscores.h">
       <Filter>Header Files</Filter>
     </ClInclude>

@@ -1,29 +1,13 @@
 #include "muscle.h"
 #include "mpcflat.h"
+#include "hmmrolling.h"
 
 void CalcPostFlat(const float *FlatFwd, const float *FlatBwd,
   uint LX, uint LY, float *Post)
 	{
 	float Total = CalcTotalProbFlat(FlatFwd, FlatBwd, LX, LY);
 
-	uint IxFB = HMMSTATE_COUNT*((LY + 1) + 1); // M[1,1]
-	uint IxPost = 0;
-	for (uint i = 0; i < LX; ++i)
-		{
-		for (uint j = 0; j < LY; ++j)
-			{
-			float Score = FlatFwd[IxFB] + FlatBwd[IxFB] - Total;
-			if (Score < MIN_SPARSE_SCORE)
-				Post[IxPost++] = 0;
-			else
-				{
-				float P = (Score >= LOG_ONE ? 1.0f : expf(Score));
-				Post[IxPost++] = P;
-				}
-			IxFB += HMMSTATE_COUNT;
-			}
-		IxFB += HMMSTATE_COUNT;
-		}
+	CalcPostFromMatches<HMMSTATE_COUNT, HMMSTATE_COUNT>(FlatFwd, FlatBwd, LX, LY, Total, Post);
 	}
 
 void MPCFlat::CalcFwdFlat_MPCFlat(uint GSIX, uint LX,

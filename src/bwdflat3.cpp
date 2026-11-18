@@ -1,7 +1,10 @@
 #include "muscle.h"
+#include "hmmrolling.h"
+#include "hmmsimd.h"
+#include "mega.h"
 
 /***
-Bwd[s][i][j] = 
+Bwd[s][i][j] =
 	probability of starting in state s and aligning
 	last (LX-i) letters of X to
 	last (LY-j) letters of Y.
@@ -15,170 +18,234 @@ void CalcBwdFlat(const byte *X, uint LX, const byte *Y, uint LY, float *Flat)
 	if (double(LX)*double(LY)*5 + 100 > double(INT_MAX))
 		Die("HMM overflow, sequence lengths %u, %u (max ~21k)", LX, LY);
 
-	const int iLX = int(LX);
-	const int iLY = int(LY);
+	const size_t RightOffset = size_t(LY)*HMMSTATE_COUNT;
+	const size_t Stride = RightOffset + HMMSTATE_COUNT;
+	float *Row = Flat + LX*Stride;
+	float *Cell = Row + RightOffset;
+	Cell[HMMSTATE_M] = tSM;
+	Cell[HMMSTATE_IX] = tSI;
+	Cell[HMMSTATE_IY] = tSI;
+	Cell[HMMSTATE_JX] = tSJ;
+	Cell[HMMSTATE_JY] = tSJ;
 
-	const int LY1 = LY+1;
-	const int BaseInc_i = HMMSTATE_COUNT*LY1;
-	const int BaseInc_j = HMMSTATE_COUNT;
-
-	uint Base = HMMSTATE_COUNT*(0*(LY1) + LY);
-	for (int i = 0; i < iLX; ++i)
+	// The last row permits only transitions consuming Y.
+	for (uint j = LY; j > 1; )
 		{
-		Flat[Base + HMMSTATE_IY] = LOG_ZERO;
-		Flat[Base + HMMSTATE_JY] = LOG_ZERO;
-		Base += BaseInc_i;
+		--j;
+		const char y = Y[j];
+		const float Emit_y = InsScore[y];
+		const float NextIY = Cell[HMMSTATE_IY] + Emit_y;
+		const float NextJY = Cell[HMMSTATE_JY] + Emit_y;
+		const float M_IY = tMI + NextIY;
+		const float M_JY = tMJ + NextJY;
+		Cell -= HMMSTATE_COUNT;
+		Cell[HMMSTATE_M] = LOG_ADD(M_IY, M_JY);
+		Cell[HMMSTATE_IX] = LOG_ZERO;
+		Cell[HMMSTATE_JX] = LOG_ZERO;
+		Cell[HMMSTATE_IY] = tII + NextIY;
+		Cell[HMMSTATE_JY] = tJJ + NextJY;
 		}
+	if (LY != 0)
+		std::fill_n(Row, HMMSTATE_COUNT, LOG_ZERO);
+	if (LX == 0)
+		return;
 
-	Base = HMMSTATE_COUNT*(LX*(LY1) + 0);
-	for (int j = 0; j < iLY; ++j)
+	for (uint i = LX - 1; i > 0; --i)
 		{
-		Flat[Base + HMMSTATE_IX] = LOG_ZERO;
-		Flat[Base + HMMSTATE_JX] = LOG_ZERO;
-		Base += BaseInc_j;
-		}
+		const float *Below = Row;
+		Row -= Stride;
+		const char x = X[i];
+		const float Emit_x = InsScore[x];
+		const float *MatchRow = MatchScore[x];
 
-	int Base_i_j = (int) HMMSTATE_COUNT*(LX*(LY1) + LY);
-	int Base_i1_j = Base_i_j + BaseInc_i;
-	int Base_i_j1 = Base_i_j + BaseInc_j;
-	int Base_i1_j1 = Base_i_j + BaseInc_i + BaseInc_j;
+		// The last column permits only transitions consuming X.
+		Cell = Row + RightOffset;
+		const float *BelowCell = Below + RightOffset;
+		const float RightIX = BelowCell[HMMSTATE_IX] + Emit_x;
+		const float RightJX = BelowCell[HMMSTATE_JX] + Emit_x;
+		const float RightM_IX = tMI + RightIX;
+		const float RightM_JX = tMJ + RightJX;
+		Cell[HMMSTATE_M] = LOG_ADD(RightM_IX, RightM_JX);
+		Cell[HMMSTATE_IX] = tII + RightIX;
+		Cell[HMMSTATE_JX] = tJJ + RightJX;
+		Cell[HMMSTATE_IY] = LOG_ZERO;
+		Cell[HMMSTATE_JY] = LOG_ZERO;
 
-	for (int i = iLX; i >= 0; --i)
-		{
-		char x = (i == iLX ? 0 : X[i]);
-		float Emit_x = InsScore[x];
-
-		for (int j = iLY; j >= 0; --j)
+		float RightIY = LOG_ZERO;
+		float RightJY = LOG_ZERO;
+		for (uint j = LY; j > 1; )
 			{
-			if (i == LX && j == LY)
-				{
-			// Special case for end-of-alignment
-				Flat[Base_i_j + HMMSTATE_M] = tSM;
-				Flat[Base_i_j + HMMSTATE_IX] = tSI;
-				Flat[Base_i_j + HMMSTATE_IY] = tSI;
-				Flat[Base_i_j + HMMSTATE_JX] = tSJ;
-				Flat[Base_i_j + HMMSTATE_JY] = tSJ;
+			--j;
+			const char y = Y[j];
+			const float Emit_y = InsScore[y];
+			const float NextM = BelowCell[HMMSTATE_M] + MatchRow[y];
+			Cell -= HMMSTATE_COUNT;
+			BelowCell -= HMMSTATE_COUNT;
+			const float NextIX = BelowCell[HMMSTATE_IX] + Emit_x;
+			const float NextJX = BelowCell[HMMSTATE_JX] + Emit_x;
+			const float NextIY = RightIY + Emit_y;
+			const float NextJY = RightJY + Emit_y;
 
-				Base_i_j -= BaseInc_j;
-				Base_i1_j -= BaseInc_j;
-				Base_i_j1 -= BaseInc_j;
-				Base_i1_j1 -= BaseInc_j;
-				continue;
-				}
+			const float M_M = tMM + NextM;
+			const float M_IX = tMI + NextIX;
+			const float M_JX = tMJ + NextJX;
+			const float M_IY = tMI + NextIY;
+			const float M_JY = tMJ + NextJY;
+			Cell[HMMSTATE_M] = LOG_ADD(M_M, M_IX, M_JX, M_IY, M_JY);
 
-			char y = (j == iLY ? 0 : Y[j]);
-			float Emit_y = InsScore[y];
-			float Emit_xy = MatchScore[x][y];
+			const float I_M = tIM + NextM;
+			const float J_M = tJM + NextM;
+			const float IX_IX = tII + NextIX;
+			Cell[HMMSTATE_IX] = LOG_ADD(IX_IX, I_M);
+			const float JX_JX = tJJ + NextJX;
+			Cell[HMMSTATE_JX] = LOG_ADD(JX_JX, J_M);
+			const float IY_IY = tII + NextIY;
+			RightIY = LOG_ADD(IY_IY, I_M);
+			Cell[HMMSTATE_IY] = RightIY;
+			const float JY_JY = tJJ + NextJY;
+			RightJY = LOG_ADD(JY_JY, J_M);
+			Cell[HMMSTATE_JY] = RightJY;
+			}
 
-			if (i < iLX && j < iLY)
-				{
-				float NextM  = Flat[Base_i1_j1 + HMMSTATE_M] + Emit_xy;
-				float NextIX = Flat[Base_i1_j + HMMSTATE_IX] + Emit_x;
-				float NextJX = Flat[Base_i1_j + HMMSTATE_JX] + Emit_x;
-				float NextIY = Flat[Base_i_j1 + HMMSTATE_IY] + Emit_y;
-				float NextJY = Flat[Base_i_j1 + HMMSTATE_JY] + Emit_y;
-
-				if (i > 0 && j > 0)
-					{
-					float M_M  = tMM + NextM;
-					float M_IX = tMI + NextIX;
-					float M_JX = tMJ + NextJX;
-					float M_IY = tMI + NextIY;
-					float M_JY = tMJ + NextJY;
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ADD(M_M, M_IX, M_JX, M_IY, M_JY);
-					}
-				else
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ZERO;
-
-				if (i > 0)
-					{
-					float IX_IX = tII + NextIX;
-					float IX_M = tIM + NextM;
-					Flat[Base_i_j + HMMSTATE_IX] = LOG_ADD(IX_IX,  IX_M);
-
-					float JX_JX = tJJ + NextJX;
-					float JX_M = tJM + NextM;
-					Flat[Base_i_j + HMMSTATE_JX] = LOG_ADD(JX_JX,  JX_M);
-					}
-				else
-					{
-					Flat[Base_i_j + HMMSTATE_IX] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_JX] = LOG_ZERO;
-					}
-
-				if (j > 0)
-					{
-					float IY_IY = tII + NextIY;
-					float IY_M = tIM + NextM;
-					Flat[Base_i_j + HMMSTATE_IY] = LOG_ADD(IY_IY,  IY_M);
-
-					float JY_JY = tJJ + NextJY;
-					float JY_M = tJM + NextM;
-					Flat[Base_i_j + HMMSTATE_JY] = LOG_ADD(JY_JY,  JY_M);
-					}
-				else
-					{
-					Flat[Base_i_j + HMMSTATE_IY] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_JY] = LOG_ZERO;
-					}
-
-				Base_i_j -= BaseInc_j;
-				Base_i1_j -= BaseInc_j;
-				Base_i_j1 -= BaseInc_j;
-				Base_i1_j1 -= BaseInc_j;
-				continue;
-				}
-
-			if (i < iLX)
-				{
-				assert(j == iLY);
-				if (i > 0)
-					{
-					float NextIX = Flat[Base_i1_j + HMMSTATE_IX] + Emit_x;
-					float NextJX = Flat[Base_i1_j + HMMSTATE_JX] + Emit_x;
-
-					float M_IX = tMI + NextIX;
-					float M_JX = tMJ + NextJX;
-
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ADD(M_IX, M_JX);
-					Flat[Base_i_j + HMMSTATE_IX] = tII + NextIX;
-					Flat[Base_i_j + HMMSTATE_JX] = tJJ + NextJX;
-					}
-				else
-					{
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_IX] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_JX] = LOG_ZERO;
-					}
-				}
-
-			if (j < iLY)
-				{
-				assert(i == iLX);
-
-				float NextIY = Flat[Base_i_j1 + HMMSTATE_IY] + Emit_y;
-				float NextJY = Flat[Base_i_j1 + HMMSTATE_JY] + Emit_y;
-
-				float M_IY = tMI + NextIY;
-				float M_JY = tMJ + NextJY;
-				if (j > 0)
-					{
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ADD(M_IY, M_JY);
-					Flat[Base_i_j + HMMSTATE_IY] = tII + NextIY;
-					Flat[Base_i_j + HMMSTATE_JY] = tJJ + NextJY;
-					}
-				else
-					{
-					Flat[Base_i_j + HMMSTATE_M] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_IY] = LOG_ZERO;
-					Flat[Base_i_j + HMMSTATE_JY] = LOG_ZERO;
-					}
-				}
-
-			Base_i_j -= BaseInc_j;
-			Base_i1_j -= BaseInc_j;
-			Base_i_j1 -= BaseInc_j;
-			Base_i1_j1 -= BaseInc_j;
+		if (LY != 0)
+			{
+			// At j == 0, only X insertions can start from this cell.
+			const char y = Y[0];
+			const float NextM = Below[HMMSTATE_COUNT + HMMSTATE_M] + MatchRow[y];
+			// Round the emission sum before adding the transition, as in the interior.
+			const volatile float NextIX = Below[HMMSTATE_IX] + Emit_x;
+			const volatile float NextJX = Below[HMMSTATE_JX] + Emit_x;
+			const float IX_IX = tII + NextIX;
+			const float IX_M = tIM + NextM;
+			const float JX_JX = tJJ + NextJX;
+			const float JX_M = tJM + NextM;
+			Row[HMMSTATE_M] = LOG_ZERO;
+			Row[HMMSTATE_IX] = LOG_ADD(IX_IX, IX_M);
+			Row[HMMSTATE_JX] = LOG_ADD(JX_JX, JX_M);
+			Row[HMMSTATE_IY] = LOG_ZERO;
+			Row[HMMSTATE_JY] = LOG_ZERO;
 			}
 		}
+
+	// At i == 0, only Y insertions can start from an interior column.
+	Cell = Flat + RightOffset;
+	std::fill_n(Cell, HMMSTATE_COUNT, LOG_ZERO);
+	if (LY == 0)
+		return;
+	const char x = X[0];
+	const float *MatchRow = MatchScore[x];
+	const float *BelowCell = Row + RightOffset;
+	for (uint j = LY; j > 1; )
+		{
+		--j;
+		const char y = Y[j];
+		const float Emit_y = InsScore[y];
+		const float NextM = BelowCell[HMMSTATE_M] + MatchRow[y];
+		const volatile float NextIY = Cell[HMMSTATE_IY] + Emit_y;
+		const volatile float NextJY = Cell[HMMSTATE_JY] + Emit_y;
+		const float IY_IY = tII + NextIY;
+		const float IY_M = tIM + NextM;
+		const float JY_JY = tJJ + NextJY;
+		const float JY_M = tJM + NextM;
+		Cell -= HMMSTATE_COUNT;
+		BelowCell -= HMMSTATE_COUNT;
+		Cell[HMMSTATE_M] = LOG_ZERO;
+		Cell[HMMSTATE_IX] = LOG_ZERO;
+		Cell[HMMSTATE_JX] = LOG_ZERO;
+		Cell[HMMSTATE_IY] = LOG_ADD(IY_IY, IY_M);
+		Cell[HMMSTATE_JY] = LOG_ADD(JY_JY, JY_M);
+		}
+	std::fill_n(Flat, HMMSTATE_COUNT, LOG_ZERO);
 	}
+
+#if MUSCLE_HMM_SIMD
+// Reuse the forward scratch as two rows of [M, IX, IY, JX]. Only M, IX and
+// JX are read from the row below. IY and JY for the current row stay in RightInsert.
+void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
+  const float *Fwd, const float *End, float Total, float *Work, float *Post)
+	{
+	asserta(!Mega::m_Loaded && LX > 0 && LY > 0);
+#include "hmmscores.h"
+	const uint M = HMMSTATE_M;
+	const uint IX = HMMSTATE_IX;
+	const uint IY = HMMSTATE_IY;
+	const uint JX = HMMSTATE_JX;
+	const uint Step = BWD_POST_ROW_STATES;
+	const size_t Width = size_t(LY) + 1;
+	const size_t LastColumn = size_t(LY)*Step;
+	float *Row = Work;
+	float *Below = Work + Width*Step;
+	const float *FwdRow = Fwd + size_t(LX)*Width;
+	float *PostRow = Post + size_t(LX - 1)*LY;
+
+	float *Cell = Row + LastColumn;
+	_mm_storeu_ps(Cell, _mm_loadu_ps(End));
+	float RightIY = End[HMMSTATE_IY];
+	float RightJY = End[HMMSTATE_JY];
+	for (uint j = LY; j > 1; )
+		{
+		--j;
+		Cell -= Step;
+		const float Emit_y = InsScore[char(Y[j])];
+		const float NextIY = RightIY + Emit_y;
+		const float NextJY = RightJY + Emit_y;
+		const float M_IY = tMI + NextIY;
+		const float M_JY = tMJ + NextJY;
+		Cell[M] = LOG_ADD(M_IY, M_JY);
+		Cell[IX] = LOG_ZERO;
+		Cell[IY] = LOG_ZERO;
+		Cell[JX] = LOG_ZERO;
+		RightIY = tII + NextIY;
+		RightJY = tJJ + NextJY;
+		}
+	CalcPostFromMatches<1, Step, false>(FwdRow + 1, Row + Step, 1, LY, Total, PostRow);
+
+	const __m128 OpenInsert = _mm_setr_ps(tMI, tMI, tMJ, tMJ);
+	const __m128 ExtendInsert = _mm_setr_ps(tII, tII, tJJ, tJJ);
+	const __m128 CloseInsert = _mm_setr_ps(tIM, tIM, tJM, tJM);
+	for (uint i = LX; i > 1; )
+		{
+		--i;
+		std::swap(Row, Below);
+		FwdRow -= Width;
+		PostRow -= LY;
+		const char x = X[i];
+		const float Emit_x = InsScore[x];
+		const float *MatchScores = MatchScore[x];
+
+		Cell = Row + LastColumn;
+		const float *BelowCell = Below + LastColumn;
+		const float RightIX = BelowCell[IX] + Emit_x;
+		const float RightJX = BelowCell[JX] + Emit_x;
+		Cell[M] = LOG_ADD(tMI + RightIX, tMJ + RightJX);
+		Cell[IX] = tII + RightIX;
+		Cell[IY] = LOG_ZERO;
+		Cell[JX] = tJJ + RightJX;
+
+		__m128 RightInsert = _mm_set1_ps(LOG_ZERO);
+		for (uint j = LY; j > 1; )
+			{
+			--j;
+			const char y = Y[j];
+			const float Emit_y = InsScore[y];
+			const float EmittedMatch = HMMRound(BelowCell[M] + MatchScores[y]);
+			Cell -= Step;
+			BelowCell -= Step;
+			const __m128 BelowStates = _mm_loadu_ps(BelowCell);
+			const __m128 Vertical = _mm_permute_ps(BelowStates, _MM_SHUFFLE(JX, JX, IX, IX));
+			const __m128 Emit = _mm_setr_ps(Emit_x, Emit_y, Emit_x, Emit_y);
+			const __m128 Next = HMMRound(_mm_add_ps(_mm_blend_ps(Vertical, RightInsert, 0xA), Emit));
+			const __m128 MatchToInsert = _mm_add_ps(Next, OpenInsert);
+			const float Match = LOG_ADD(tMM + EmittedMatch, HMMInsertLane<0>(MatchToInsert),
+			  HMMInsertLane<2>(MatchToInsert), HMMInsertLane<1>(MatchToInsert),
+			  HMMInsertLane<3>(MatchToInsert));
+			const __m128 Extend = _mm_add_ps(Next, ExtendInsert);
+			const __m128 Close = _mm_add_ps(_mm_set1_ps(EmittedMatch), CloseInsert);
+			RightInsert = HMMLogAdd4(Extend, Close);
+			const __m128 Packed = _mm_permute_ps(RightInsert, _MM_SHUFFLE(2, 1, 0, 0));
+			_mm_storeu_ps(Cell, _mm_move_ss(Packed, _mm_set_ss(Match)));
+			}
+		CalcPostFromMatches<1, Step, false>(FwdRow + 1, Row + Step, 1, LY, Total, PostRow);
+		}
+	}
+#endif

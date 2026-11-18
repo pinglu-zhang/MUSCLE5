@@ -475,6 +475,7 @@
     <ClInclude Include="gtbuilder.h" />
     <ClInclude Include="heatmapcolors.h" />
     <ClInclude Include="hmmparams.h" />
+    <ClInclude Include="hmmrolling.h" />
     <ClInclude Include="hmmscores.h" />
     <ClInclude Include="hmmtrans.h" />
     <ClInclude Include="intmath.h" />

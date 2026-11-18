@@ -15,7 +15,6 @@ void MPCFlat::Clear()
 	m_GuideTree.Clear();
 	m_DistMx.clear();
 	m_Pairs.clear();
-	m_PairToIndex.clear();
 	m_JoinIndexes1.clear();
 	m_JoinIndexes2.clear();
 	m_Weights.clear();
@@ -58,14 +57,15 @@ const byte *MPCFlat::GetBytePtr(uint SeqIndex) const
 
 uint MPCFlat::GetPairIndex(uint SMI1, uint SMI2) const
 	{
-	//asserta(SMI1 > SMI2);
-	//uint PairIndex = SMI2 + (SMI1*(SMI1 - 1))/2;
-	asserta(SMI1 < SMI2);
-	const pair<uint, uint> Pair(SMI1, SMI2);
-	map<pair<uint, uint>, uint>::const_iterator p = m_PairToIndex.find(Pair);
-	asserta(p != m_PairToIndex.end());
-	uint PairIndex = p->second;
-	return PairIndex;
+	const uint N = GetSeqCount();
+	asserta(SMI1 < SMI2 && SMI2 < N);
+	// InitPairs enumerates rows i, then j=i+1..N-1. Widen before
+	// multiplication; the pair order and the public uint result are unchanged.
+	const uint64 Index = uint64(SMI1)*(2*uint64(N) - SMI1 - 1)/2
+	  + uint64(SMI2 - SMI1 - 1);
+	asserta(Index <= UINT_MAX);
+	asserta(Index < m_Pairs.size());
+	return uint(Index);
 	}
 
 const pair<uint, uint> &MPCFlat::GetPair(uint PairIndex) const
@@ -140,15 +140,12 @@ void MPCFlat::InitPairs()
 	{
 	const uint SeqCount = GetSeqCount();
 	m_Pairs.clear();
-	m_PairToIndex.clear();
 	uint PairIndex = 0;
 	for (uint SeqIndex1 = 0; SeqIndex1 < SeqCount; ++SeqIndex1)
 		for (uint SeqIndex2 = SeqIndex1 + 1; SeqIndex2 < SeqCount; ++SeqIndex2)
 			{
 			const pair<uint, uint> Pair(SeqIndex1, SeqIndex2);
 			m_Pairs.push_back(Pair);
-			assert(m_PairToIndex.find(Pair) == m_PairToIndex.end());
-			m_PairToIndex[Pair] = PairIndex;
 			uint PairIndex2 = GetPairIndex(SeqIndex1, SeqIndex2);
 			asserta(PairIndex2 == PairIndex);
 			++PairIndex;

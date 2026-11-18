@@ -38,7 +38,6 @@ public:
 
 	vector<vector<float> > m_DistMx;
 	vector<pair<uint, uint> > m_Pairs;
-	map<pair<uint, uint>, uint> m_PairToIndex;
 	vector<uint> m_JoinIndexes1;
 	vector<uint> m_JoinIndexes2;
 
