@@ -20,11 +20,13 @@ void CalcRollingPostInPlace(const byte *X, uint LX, const byte *Y, uint LY,
   float *Fwd)
 	{
 #if MUSCLE_HMM_SIMD && defined(__AVX2__)
-	if (LX > 0 && LY > 0 && LX <= diagonal_hmm::MaxLength && LY <= diagonal_hmm::MaxLength)
+	if (LX > 0 && LY > 0 && LX <= diagonal_hmm::ShortLimit && LY <= diagonal_hmm::ShortLimit)
 		{
-		diagonal_hmm::calculate(X, LX, Y, LY, Fwd);
+		diagonal_hmm::calculateShort(X, LX, Y, LY, Fwd);
 		return;
 		}
+	if (diagonal_hmm::tryMedium(X, LX, Y, LY, Fwd))
+		return;
 #endif
 	const size_t Cells = (size_t(LX) + 1)*(size_t(LY) + 1);
 	float *Work = Fwd + Cells;

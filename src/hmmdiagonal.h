@@ -1,14 +1,17 @@
 #pragma once
+#include <memory>
+#include <new>
 
 // Independent cells on i+j=d use only diagonals d-1 and d-2 (or d+1 and d+2).
 // Keep lanes in increasing column order. The two scalar axes use the original
 // recurrences; padding belongs only to scratch, never to the returned posterior.
 namespace diagonal_hmm {
 using V = __m256;
-const unsigned MaxLength = 256;
-const unsigned Pitch = MaxLength + 16;
+const unsigned ShortLimit = 256;
+const unsigned MediumLimit = 1024;
 enum { M, IX, IY, JX, JY, States };
-struct Diagonal { float s[States][Pitch]; };
+template<unsigned Capacity>
+struct Diagonal { float s[States][Capacity + 16]; };
 inline V load(const float *p) { return _mm256_loadu_ps(p); }
 inline void put(float *p, V x) { _mm256_storeu_ps(p,x); }
 inline V splat(float x) { return _mm256_set1_ps(x); }
@@ -34,8 +37,9 @@ inline V logadd(V x, V y)
 	return _mm256_blendv_ps(p+lo,hi,skip);
 	}
 
-struct Emissions
+template<unsigned Capacity> struct Emissions
 	{
+	static constexpr unsigned Pitch = Capacity + 16;
 	int x[Pitch] = {}, y[Pitch] = {};
 	float ex[Pitch] = {}, ey[Pitch] = {};
 	Emissions(const byte *X,int nx,const byte *Y,int ny)
@@ -53,7 +57,17 @@ struct Emissions
 		}
 	};
 
-inline void zeroCell(Diagonal &a,int j)
+template<unsigned Capacity> struct Workspace
+	{
+	Emissions<Capacity> emissions;
+	Diagonal<Capacity> ring[3] = {};
+
+	Workspace(const byte *x, int nx, const byte *y, int ny)
+	  : emissions(x, nx, y, ny) {}
+	};
+
+template<unsigned Capacity>
+inline void zeroCell(Diagonal<Capacity> &a,int j)
 	{ for (int k=0;k<States;++k) a.s[k][j]=LOG_ZERO; }
 
 __attribute__((optimize("no-tree-vectorize","no-associative-math")))
@@ -67,12 +81,13 @@ static void decode(float *out, const float *matches, int d,int ny,int lo,int hi,
 		}
 	}
 
-static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out)
+template<unsigned Capacity>
+static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
+  Workspace<Capacity> &work)
 	{
 #include "hmmscores.h"
-	Emissions e(X,nx,Y,ny);
-	Diagonal ring[3] = {};
-	Diagonal *old=&ring[0], *prev=&ring[1], *cur=&ring[2];
+	const auto &e = work.emissions;
+	auto *old = &work.ring[0], *prev = &work.ring[1], *cur = &work.ring[2];
 	zeroCell(*old,0);
 	zeroCell(*prev,0);
 	zeroCell(*prev,1);
@@ -158,5 +173,27 @@ static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out)
 		decode(out,cur->s[M],d,ny,lo,hi,total);
 		std::swap(old,prev); std::swap(prev,cur);
 		}
+	}
+
+static void calculateShort(const byte *x, int nx, const byte *y, int ny, float *out)
+	{
+	Workspace<ShortLimit> work(x, nx, y, ny);
+	calculate(x, nx, y, ny, out, work);
+	}
+
+static bool tryMedium(const byte *x, unsigned nx, const byte *y, unsigned ny, float *out)
+	{
+	// Very narrow diagonals leave most SIMD lanes idle. Use the rolling
+	// implementation for these shapes and for pairs above the workspace cap.
+	if (nx < 32 || ny < 32 || nx > MediumLimit || ny > MediumLimit)
+		return false;
+	// Keep the larger workspace off OpenMP worker stacks. A failed allocation
+	// leaves the caller's original rolling implementation available.
+	std::unique_ptr<Workspace<MediumLimit>> work(
+	  new (std::nothrow) Workspace<MediumLimit>(x, nx, y, ny));
+	if (!work)
+		return false;
+	calculate(x, nx, y, ny, out, *work);
+	return true;
 	}
 } // namespace diagonal_hmm
