@@ -82,6 +82,10 @@ public:
 	void ProgressiveAlign();
 	void Refine();
 	void RefineIter();
+	void RefineIter(bool UseRowPosts);
+	bool PrepareRefinementPosts();
+	void BuildRefinementPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
+	  float *Post);
 	void ProgAln(uint JoinIndex);
 	const pair<uint, uint> &GetPair(uint PairIndex) const;
 	const char *GetLabel(uint SeqIndex) const;
@@ -96,6 +100,8 @@ public:
 	const Sequence *GetSequence(uint SeqIndex) const;
 	MultiSequence *AlignAlns(const MultiSequence &MSA1,
 	  const MultiSequence &MSA2, float *ptrScore = 0);
+	MultiSequence *AlignAlns(const MultiSequence &MSA1, const MultiSequence &MSA2,
+	  float *ptrScore, bool UseRowPosts);
 	void GetLabelToMSASeqIndex(unordered_map<string, uint> &LabelToMSASeqIndex) const;
 	void SortMSA_ByInputOrder();
 	void SortMSA_ByGuideTree();

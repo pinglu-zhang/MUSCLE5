@@ -7,6 +7,12 @@ float CalcAlnFlat(const float *Post, uint LX, uint LY,
 MultiSequence *MPCFlat::AlignAlns(const MultiSequence &MSA1,
   const MultiSequence &MSA2, float *ptrScore)
 	{
+	return AlignAlns(MSA1, MSA2, ptrScore, false);
+	}
+
+MultiSequence *MPCFlat::AlignAlns(const MultiSequence &MSA1,
+  const MultiSequence &MSA2, float *ptrScore, bool UseRowPosts)
+	{
 	const uint SeqCount1 = MSA1.GetSeqCount();
 	const uint SeqCount2 = MSA2.GetSeqCount();
 
@@ -20,7 +26,10 @@ MultiSequence *MPCFlat::AlignAlns(const MultiSequence &MSA1,
 		m_Weights.assign(SeqCount, 1.0f);
 
 	float *Post = AllocPost(ColCount1, ColCount2);
-	BuildPost(MSA1, MSA2, Post);
+	if (UseRowPosts)
+		BuildRefinementPost(MSA1, MSA2, Post);
+	else
+		BuildPost(MSA1, MSA2, Post);
 
 	float *DPRows = AllocDPRows(ColCount1, ColCount2);
 	char *TB = AllocTB(ColCount1, ColCount2);

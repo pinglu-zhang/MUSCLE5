@@ -253,10 +253,11 @@ void MPCFlat::Refine()
 	const uint SeqCount = GetSeqCount();
 	if (SeqCount < 3)
 		return;
+	const bool UseRowPosts = PrepareRefinementPosts();
 	for (uint Iter = 0; Iter < m_RefineIterCount; ++Iter)
 		{
 		ProgressStep(Iter, m_RefineIterCount, "Refining");
-		RefineIter();
+		RefineIter(UseRowPosts);
 		}
 	}
 

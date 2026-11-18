@@ -3,6 +3,11 @@
 
 void MPCFlat::RefineIter()
 	{
+	RefineIter(false);
+	}
+
+void MPCFlat::RefineIter(bool UseRowPosts)
+	{
 	set<int> SeqIndexes1, SeqIndexes2;
 
 	const uint SeqCount = GetSeqCount();
@@ -23,7 +28,7 @@ void MPCFlat::RefineIter()
 	const MultiSequence *MSA2 = m_MSA->Project(SeqIndexes2);
 	delete m_MSA;
 
-	MultiSequence *MSA12 = AlignAlns(*MSA1, *MSA2);
+	MultiSequence *MSA12 = AlignAlns(*MSA1, *MSA2, nullptr, UseRowPosts);
 	m_MSA = MSA12;
 
 	delete MSA1;
