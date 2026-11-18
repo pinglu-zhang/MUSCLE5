@@ -31,7 +31,14 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 
 // for each s in MSA1
 	vector<uint> PosToCol1;
-	vector<uint> PosToCol2;
+	vector<vector<uint> > ColumnMaps2(SeqCount2);
+	vector<uint> InputIndexes2(SeqCount2);
+	for (uint s = 0; s < SeqCount2; ++s)
+		{
+		const Sequence *Seq2 = MSA2.GetSequence(s);
+		InputIndexes2[s] = GetMyInputSeqIndex(Seq2->m_Label);
+		Seq2->GetPosToCol(ColumnMaps2[s]);
+		}
 	for (uint SeqIndex1 = 0; SeqIndex1 < SeqCount1; ++SeqIndex1)
 		{
 		const Sequence *Seq1 = MSA1.GetSequence(SeqIndex1);
@@ -44,13 +51,12 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 	// for each t in MSA2
 		for (uint SeqIndex2 = 0; SeqIndex2 < SeqCount2; SeqIndex2++)
 			{
-			const Sequence *Seq2 = MSA2.GetSequence(SeqIndex2);
-			uint SMI_2 = GetMyInputSeqIndex(Seq2->m_Label);
+			const vector<uint> &PosToCol2 = ColumnMaps2[SeqIndex2];
+			uint SMI_2 = InputIndexes2[SeqIndex2];
 			asserta(SMI_2 != UINT_MAX);
 			asserta(SMI_1 != SMI_2);
 			const float w2 = m_Weights[SeqIndex2];
 
-			Seq2->GetPosToCol(PosToCol2);
 
 			if (SMI_1 < SMI_2)
 				{
@@ -63,8 +69,8 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 				for (uint i = 0; i < LX; ++i)
 					{
 					uint Col1 = PosToCol1[i];
-					uint Offset = Mx.GetOffset(i);
-					uint Size = Mx.GetSize(i);
+					uint Offset = Mx.m_Offsets[i];
+					uint Size = (Mx.m_Offsets[i+1] - Mx.m_Offsets[i]);
 					for (uint k = 0; k < Size; ++k)
 						{
 						float P = Mx.GetProb_Offset(Offset);
@@ -86,8 +92,8 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 				for (uint i = 0; i < LX; ++i)
 					{
 					uint Col2 = PosToCol2[i];
-					uint Offset = Mx.GetOffset(i);
-					uint Size = Mx.GetSize(i);
+					uint Offset = Mx.m_Offsets[i];
+					uint Size = (Mx.m_Offsets[i+1] - Mx.m_Offsets[i]);
 					for (uint k = 0; k < Size; ++k)
 						{
 						float P = Mx.GetProb_Offset(Offset);

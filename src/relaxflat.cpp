@@ -11,15 +11,15 @@ void RelaxFlat_XZ_ZY(const MySparseMx &XZ, const MySparseMx &ZY,
 
 	for (uint PosX = 0; PosX < LX; ++PosX)
 		{
-		uint Offset_XZ = XZ.GetOffset(PosX);
-		uint Size_XZ = XZ.GetSize(PosX);
+		uint Offset_XZ = XZ.m_Offsets[PosX];
+		uint Size_XZ = (XZ.m_Offsets[PosX+1] - XZ.m_Offsets[PosX]);
 		for (uint k = 0; k < Size_XZ; ++k)
 			{
 			float P_XZ = XZ.GetProb_Offset(Offset_XZ + k);
 			uint PosZ = XZ.GetCol_Offset(Offset_XZ + k);
 
-			uint Offset_ZY = ZY.GetOffset(PosZ);
-			uint Size_ZY = ZY.GetSize(PosZ);
+			uint Offset_ZY = ZY.m_Offsets[PosZ];
+			uint Size_ZY = (ZY.m_Offsets[PosZ+1] - ZY.m_Offsets[PosZ]);
 			for (uint m = 0; m < Size_ZY; ++m)
 				{
 				float P_ZY = ZY.GetProb_Offset(Offset_ZY + m);
@@ -40,15 +40,15 @@ void RelaxFlat_ZX_ZY(const MySparseMx &ZX, const MySparseMx &ZY,
 
 	for (uint PosZ = 0; PosZ < LZ; ++PosZ)
 		{
-		uint Offset_ZX = ZX.GetOffset(PosZ);
-		uint Size_ZX = ZX.GetSize(PosZ);
+		uint Offset_ZX = ZX.m_Offsets[PosZ];
+		uint Size_ZX = (ZX.m_Offsets[PosZ+1] - ZX.m_Offsets[PosZ]);
 		for (uint k = 0; k < Size_ZX; ++k)
 			{
 			float P_ZX = ZX.GetProb_Offset(Offset_ZX + k);
 			uint PosX = ZX.GetCol_Offset(Offset_ZX + k);
 
-			uint Offset_ZY = ZY.GetOffset(PosZ);
-			uint Size_ZY = ZY.GetSize(PosZ);
+			uint Offset_ZY = ZY.m_Offsets[PosZ];
+			uint Size_ZY = (ZY.m_Offsets[PosZ+1] - ZY.m_Offsets[PosZ]);
 			for (uint m = 0; m < Size_ZY; ++m)
 				{
 				float P_ZY = ZY.GetProb_Offset(Offset_ZY + m);
@@ -73,8 +73,8 @@ void RelaxFlat_XZ_YZ(const MySparseMx &XZ, const MySparseMx &YZ,
 
 	for (uint PosX = 0; PosX < LX; ++PosX)
 		{
-		uint Offset_XZ = XZ.GetOffset(PosX);
-		uint Size_XZ = XZ.GetSize(PosX);
+		uint Offset_XZ = XZ.m_Offsets[PosX];
+		uint Size_XZ = (XZ.m_Offsets[PosX+1] - XZ.m_Offsets[PosX]);
 		for (uint k = 0; k < Size_XZ; ++k)
 			{
 			float P_XZ = XZ.GetProb_Offset(Offset_XZ + k);

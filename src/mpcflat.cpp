@@ -237,7 +237,7 @@ void MPCFlat::CalcPosteriors()
 	asserta(PairCount > 0);
 	unsigned ThreadCount = GetRequestedThreadCount();
 	uint PairCounter = 0;
-#pragma omp parallel for num_threads(ThreadCount)
+#pragma omp parallel for num_threads(ThreadCount) schedule(dynamic, 4)
 	for (int PairIndex = 0; PairIndex < (int) PairCount; ++PairIndex)
 		{
 		Lock();
