@@ -1,6 +1,9 @@
 #include "muscle.h"
 #include "mpcflat.h"
 
+void RelaxOnSupport(const MySparseMx &XZ, const MySparseMx &YZ,
+  const MySparseMx &XY, float *Post);
+
 #if 0//TRACE
 const byte *g_X;
 const byte *g_Y;
@@ -82,7 +85,7 @@ void MPCFlat::ConsPair(uint PairIndex)
 			const MySparseMx &XZ = GetSparsePost(PairIndexXZ);
 			const MySparseMx &YZ = GetSparsePost(PairIndexYZ);
 
-			RelaxFlat_XZ_YZ(XZ, YZ, wZ, Post);
+			RelaxOnSupport(XZ, YZ, SparsePostXY, Post);
 #if 0//TRACE
 			LogFlatMx("ConsPair after RelaxFlat_XZ_YZ", Post, LX, LY);
 #endif

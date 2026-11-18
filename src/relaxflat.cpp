@@ -92,3 +92,48 @@ void RelaxFlat_XZ_YZ(const MySparseMx &XZ, const MySparseMx &YZ,
 			}
 		}
 	}
+
+// UpdateFromPost will read only the coordinates already present in XY.
+// Intersect two sorted Z rows, accumulating each output in increasing Z order.
+void RelaxOnSupport(const MySparseMx &XZ, const MySparseMx &YZ,
+  const MySparseMx &XY, float *Post)
+	{
+	const uint LX = XY.GetLX();
+	const uint LY = XY.GetLY();
+	assert(XZ.GetLX() == LX && YZ.GetLX() == LY && XZ.GetLY() == YZ.GetLY());
+	const uint *XOffsets = XZ.m_Offsets;
+	const uint *YOffsets = YZ.m_Offsets;
+	const uint *OutputOffsets = XY.m_Offsets;
+	for (uint PosX = 0; PosX < LX; ++PosX)
+		{
+		const uint XBegin = XOffsets[PosX];
+		const uint XEnd = XOffsets[PosX+1];
+		if (XBegin == XEnd)
+			continue;
+		float *Row = Post + size_t(PosX)*LY;
+		for (uint k = OutputOffsets[PosX]; k < OutputOffsets[PosX+1]; ++k)
+			{
+			const uint PosY = XY.GetCol_Offset(k);
+			uint i = XBegin;
+			uint j = YOffsets[PosY];
+			const uint YEnd = YOffsets[PosY+1];
+			float P = Row[PosY];
+			while (i < XEnd && j < YEnd)
+				{
+				const uint a = XZ.GetCol_Offset(i);
+				const uint b = YZ.GetCol_Offset(j);
+				if (a < b)
+					++i;
+				else if (a > b)
+					++j;
+				else
+					{
+					P += XZ.GetProb_Offset(i)*YZ.GetProb_Offset(j);
+					++i;
+					++j;
+					}
+				}
+			Row[PosY] = P;
+			}
+		}
+	}
