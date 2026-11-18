@@ -8,9 +8,10 @@ void MySparseMx::AllocVec(uint Size)
 	if (m_MaxVecSize > 0)
 		myfree(m_ValueVec);
 
-	m_MaxVecSize = Size + 256;
+	// Initial capacity is known after counting nonzeros. Reserve slack only on regrowth.
+	m_MaxVecSize = Size + (m_MaxVecSize != 0 && Size <= UINT_MAX-256 ? 256 : 0);
 	asserta(sizeof(float) == 4 && sizeof(uint) == 4);
-	m_ValueVec = myalloc(byte, m_MaxVecSize*8);
+	m_ValueVec = myalloc(byte, size_t(m_MaxVecSize)*8);
 	}
 
 float MySparseMx::GetMaxProbRow(uint i) const
@@ -72,8 +73,8 @@ void MySparseMx::AllocLX(uint LX)
 	if (m_MaxLX > 0)
 		myfree(m_Offsets);
 
-	m_MaxLX = LX + 128;
-	m_Offsets = myalloc(uint, m_MaxLX+1);
+	m_MaxLX = LX + (m_MaxLX != 0 && LX <= UINT_MAX-128 ? 128 : 0);
+	m_Offsets = myalloc(uint, size_t(m_MaxLX)+1);
 #if 0//TRACE
 	Log("%p->AllocLX(%u) newmax %u m_Offsets=%p\n", this, LX, m_MaxLX, m_Offsets);
 #endif

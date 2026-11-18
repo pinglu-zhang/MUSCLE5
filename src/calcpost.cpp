@@ -12,6 +12,30 @@ static float *AllocRollingFB(uint64 MatchCells, uint64 InsertFloats)
 	return myalloc(float, size_t(Count));
 	}
 
+#if MUSCLE_HMM_SIMD
+void CalcRollingPostInPlace(const byte *X, uint LX, const byte *Y, uint LY,
+  float *Fwd)
+	{
+	const size_t Cells = (size_t(LX) + 1)*(size_t(LY) + 1);
+	float *Work = Fwd + Cells;
+	float FwdEnd[HMMSTATE_COUNT];
+	CalcFwdRolling(X, LX, Y, LY, Fwd, Work, FwdEnd);
+
+	float BwdEnd[HMMSTATE_COUNT];
+	GetBwdEnd(BwdEnd);
+	const float Total = CalcTotalProbFlat(FwdEnd, BwdEnd, 0, 0);
+	static_assert(BWD_POST_FLOATS_PER_COLUMN <= FWD_INSERT_FLOATS_PER_COLUMN,
+	  "Forward insertion rows must hold the backward workspace");
+	// The backward recurrence reads a forward match only when decoding that cell.
+	// Write the posterior to the very same cell, keeping both leading axes.
+	const size_t Width = size_t(LY) + 1;
+	CalcBwdPostStrided(X, LX, Y, LY, Fwd, BwdEnd, Total, Work, Fwd + Width + 1, Width);
+	// Other stages expect contiguous rows without either leading axis.
+	for (uint i = 0; i < LX; ++i)
+		memmove(Fwd + size_t(i)*LY, Fwd + (size_t(i)+1)*Width+1, size_t(LY)*sizeof(float));
+	}
+#endif
+
 float *CalcPost(const string &LabelX, const string &LabelY)
 	{
 	uint LX = GetSeqLengthByGlobalLabel(LabelX);
@@ -43,19 +67,8 @@ float *CalcPost(const string &LabelX, const string &LabelY)
 		const uint64 Cells = (uint64(LX) + 1)*Width;
 		Fwd = AllocRollingFB(Cells, Width*FWD_INSERT_FLOATS_PER_COLUMN);
 #if MUSCLE_HMM_SIMD
-		float *Work = Fwd + Cells;
-		float FwdEnd[HMMSTATE_COUNT];
-		CalcFwdRolling(X, LX, Y, LY, Fwd, Work, FwdEnd);
-
-		float BwdEnd[HMMSTATE_COUNT];
-		GetBwdEnd(BwdEnd);
-		const float Total = CalcTotalProbFlat(FwdEnd, BwdEnd, 0, 0);
-		Post = AllocPost(LX, LY);
-		static_assert(BWD_POST_FLOATS_PER_COLUMN <= FWD_INSERT_FLOATS_PER_COLUMN,
-		  "Forward insertion rows must hold the backward workspace");
-		CalcBwdPost(X, LX, Y, LY, Fwd, BwdEnd, Total, Work, Post);
-		myfree(Fwd);
-		return Post;
+		CalcRollingPostInPlace(X, LX, Y, LY, Fwd);
+		return Fwd;
 #else
 		Bwd = AllocFB(LX, LY);
 		float FwdEnd[HMMSTATE_COUNT];

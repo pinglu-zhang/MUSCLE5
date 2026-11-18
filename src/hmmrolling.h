@@ -20,6 +20,13 @@ inline void GetBwdEnd(float *End)
 // Work holds two rows of four floats per column, including column zero.
 void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
   const float *Fwd, const float *End, float Total, float *Work, float *Post);
+void CalcBwdPostStrided(const byte *X, uint LX, const byte *Y, uint LY,
+  const float *Fwd, const float *End, float Total, float *Work, float *Post, size_t PostStride);
+
+// Uses (LX+1)*(LY+1) + (LY+1)*FWD_INSERT_FLOATS_PER_COLUMN floats.
+// The first LX*LY floats contain the dense posterior on return.
+void CalcRollingPostInPlace(const byte *X, uint LX, const byte *Y, uint LY,
+  float *Fwd);
 
 // The match state is the first float of each cell in either layout.
 template<uint FwdStride, uint BwdStride, bool HasLeadingAxes = true>

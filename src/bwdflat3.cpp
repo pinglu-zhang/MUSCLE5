@@ -161,8 +161,8 @@ void CalcBwdFlat(const byte *X, uint LX, const byte *Y, uint LY, float *Flat)
 #if MUSCLE_HMM_SIMD
 // Reuse the forward scratch as two rows of [M, IX, IY, JX]. Only M, IX and
 // JX are read from the row below. IY and JY for the current row stay in RightInsert.
-void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
-  const float *Fwd, const float *End, float Total, float *Work, float *Post)
+void CalcBwdPostStrided(const byte *X, uint LX, const byte *Y, uint LY,
+  const float *Fwd, const float *End, float Total, float *Work, float *Post, size_t PostStride)
 	{
 	asserta(!Mega::m_Loaded && LX > 0 && LY > 0);
 #include "hmmscores.h"
@@ -176,7 +176,7 @@ void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
 	float *Row = Work;
 	float *Below = Work + Width*Step;
 	const float *FwdRow = Fwd + size_t(LX)*Width;
-	float *PostRow = Post + size_t(LX - 1)*LY;
+	float *PostRow = Post + size_t(LX - 1)*PostStride;
 
 	float *Cell = Row + LastColumn;
 	_mm_storeu_ps(Cell, _mm_loadu_ps(End));
@@ -208,7 +208,7 @@ void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
 		--i;
 		std::swap(Row, Below);
 		FwdRow -= Width;
-		PostRow -= LY;
+		PostRow -= PostStride;
 		const char x = X[i];
 		const float Emit_x = InsScore[x];
 		const float *MatchScores = MatchScore[x];
@@ -247,5 +247,11 @@ void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
 			}
 		CalcPostFromMatches<1, Step, false>(FwdRow + 1, Row + Step, 1, LY, Total, PostRow);
 		}
+	}
+
+void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
+  const float *Fwd, const float *End, float Total, float *Work, float *Post)
+	{
+	CalcBwdPostStrided(X, LX, Y, LY, Fwd, End, Total, Work, Post, LY);
 	}
 #endif
