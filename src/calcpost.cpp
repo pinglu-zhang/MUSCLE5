@@ -3,6 +3,9 @@
 #include "hmmrolling.h"
 #include "hmmsimd.h"
 #include <limits>
+#if MUSCLE_HMM_SIMD && defined(__AVX2__)
+#include "hmmdiagonal.h"
+#endif
 
 static float *AllocRollingFB(uint64 MatchCells, uint64 InsertFloats)
 	{
@@ -16,6 +19,13 @@ static float *AllocRollingFB(uint64 MatchCells, uint64 InsertFloats)
 void CalcRollingPostInPlace(const byte *X, uint LX, const byte *Y, uint LY,
   float *Fwd)
 	{
+#if MUSCLE_HMM_SIMD && defined(__AVX2__)
+	if (LX > 0 && LY > 0 && LX <= diagonal_hmm::MaxLength && LY <= diagonal_hmm::MaxLength)
+		{
+		diagonal_hmm::calculate(X, LX, Y, LY, Fwd);
+		return;
+		}
+#endif
 	const size_t Cells = (size_t(LX) + 1)*(size_t(LY) + 1);
 	float *Work = Fwd + Cells;
 	float FwdEnd[HMMSTATE_COUNT];
