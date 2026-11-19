@@ -1,5 +1,6 @@
 #include "muscle.h"
 #include "mpcflat.h"
+#include "sparseposttranspose.h"
 
 #define TRACE	0
 
@@ -111,52 +112,6 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 #endif
 	}
 
-namespace {
-// The inactive consistency matrix already owns its value buffer. The
-// reverse orientation needs exactly one offset per target residue plus a
-// sentinel. Its shape stays fixed throughout the refinement iterations.
-void ReserveRefinementRows(MySparseMx &Mx, uint Rows)
-	{
-	if (Rows <= Mx.m_MaxLX)
-		return;
-	uint *Offsets = myalloc(uint, size_t(Rows)+1);
-	myfree(Mx.m_Offsets);
-	Mx.m_Offsets = Offsets;
-	Mx.m_MaxLX = Rows;
-	}
-
-void TransposeRefinementPost(const MySparseMx &From, MySparseMx &To)
-	{
-	const uint NX = From.GetLX(), NY = From.GetLY();
-	const uint Count = From.m_Offsets[NX];
-	uint *Offsets = To.m_Offsets;
-	std::fill(Offsets, Offsets + NY, 0u);
-	for (uint k = 0; k < Count; ++k)
-		++Offsets[From.GetCol_Offset(k)];
-	uint End = 0;
-	for (uint j = 0; j < NY; ++j)
-		{
-		End += Offsets[j];
-		Offsets[j] = End;
-		}
-	Offsets[NY] = Count;
-	// Insert backwards from each row's end. After the last insertion each
-	// cursor is the row start and the entries are in increasing X order.
-	for (uint i = NX; i-- > 0;)
-		for (uint k = From.m_Offsets[i+1]; k > From.m_Offsets[i]; --k)
-			{
-			const uint At = --Offsets[From.GetCol_Offset(k-1)];
-			To.SetCol_Offset(At, i);
-			To.SetProb_Offset(At, From.GetProb_Offset(k-1));
-			}
-	To.m_LX = NY;
-	To.m_LY = NX;
-	To.m_VecSize = Count;
-	To.m_X = From.m_Y;
-	To.m_Y = From.m_X;
-	}
-}
-
 bool MPCFlat::PrepareRefinementPosts()
 	{
 	// Amortize the transpose over repeated, large profile comparisons.
@@ -190,11 +145,11 @@ bool MPCFlat::PrepareRefinementPosts()
 	// Allocate serially: the allocator also updates process-wide statistics.
 	// Parallel workers below only write to already reserved, disjoint arrays.
 	for (size_t p = 0; p < Pairs; ++p)
-		ReserveRefinementRows(*Spare[p], Active[p]->GetLY());
+		ReserveSparseRows(*Spare[p], Active[p]->GetLY());
 	const uint Threads = GetRequestedThreadCount();
 #pragma omp parallel for num_threads(Threads) schedule(static)
 	for (int64_t p = 0; p < int64_t(Pairs); ++p)
-		TransposeRefinementPost(*Active[p], *Spare[p]);
+		TransposeSparsePost(*Active[p], *Spare[p]);
 	return true;
 	}
 
