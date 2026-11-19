@@ -112,6 +112,19 @@ void MPCFlat::BuildPost(const MultiSequence &MSA1, const MultiSequence &MSA2,
 	}
 
 namespace {
+// The inactive consistency matrix already owns its value buffer. The
+// reverse orientation needs exactly one offset per target residue plus a
+// sentinel. Its shape stays fixed throughout the refinement iterations.
+void ReserveRefinementRows(MySparseMx &Mx, uint Rows)
+	{
+	if (Rows <= Mx.m_MaxLX)
+		return;
+	uint *Offsets = myalloc(uint, size_t(Rows)+1);
+	myfree(Mx.m_Offsets);
+	Mx.m_Offsets = Offsets;
+	Mx.m_MaxLX = Rows;
+	}
+
 void TransposeRefinementPost(const MySparseMx &From, MySparseMx &To)
 	{
 	const uint NX = From.GetLX(), NY = From.GetLY();
@@ -170,14 +183,14 @@ bool MPCFlat::PrepareRefinementPosts()
 			return false;
 		Entries += Count;
 		if (Mx.GetLY() > Spare[p]->m_MaxLX)
-			ExtraBytes += (uint64(Mx.GetLY()) - Spare[p]->m_MaxLX + 129)*sizeof(uint);
+			ExtraBytes += (uint64(Mx.GetLY()) - Spare[p]->m_MaxLX)*sizeof(uint);
 		}
 	if (Entries < 500000 || ExtraBytes > 4u*1024*1024)
 		return false;
 	// Allocate serially: the allocator also updates process-wide statistics.
 	// Parallel workers below only write to already reserved, disjoint arrays.
 	for (size_t p = 0; p < Pairs; ++p)
-		Spare[p]->AllocLX(Active[p]->GetLY());
+		ReserveRefinementRows(*Spare[p], Active[p]->GetLY());
 	const uint Threads = GetRequestedThreadCount();
 #pragma omp parallel for num_threads(Threads) schedule(static)
 	for (int64_t p = 0; p < int64_t(Pairs); ++p)
