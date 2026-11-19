@@ -31,7 +31,29 @@ void UClust::AddSeqToIndex(uint SeqIndex)
 	}
 
 
+static void RankCentroids(UClust &U, uint Query, uint Limit, vector<uint> &Ranked)
+	{
+	uint L;
+	const byte *Seq = U.m_InputSeqs->GetByteSeq(Query, L);
+	vector<uint> Counts;
+	U.m_US.SearchSeq(Seq, L, Ranked, Counts);
+	asserta(Ranked.size() == Counts.size());
+	if (Ranked.size() > Limit)
+		Ranked.resize(Limit);
+	}
+
 #if MUSCLE_HMM_SIMD && defined(__linux__)
+static float ScoreCentroid(const Sequence &X, const Sequence &Y, float *Fwd, string &Path)
+	{
+	const uint LX = X.GetLength();
+	const uint LY = Y.GetLength();
+	const size_t Width = size_t(LY) + 1;
+	float *Rows = Fwd + (size_t(LX)+1)*Width;
+	char *TB = reinterpret_cast<char *>(Rows + Width*FWD_INSERT_FLOATS_PER_COLUMN);
+	CalcRollingPostInPlace(X.GetBytePtr(), LX, Y.GetBytePtr(), LY, Fwd);
+	return CalcAlnFlat(Fwd, LX, LY, Rows, TB, Path)/min(LX, LY);
+	}
+
 // Evaluate a wave against one fixed centroid index. Only the serial caller
 // decides the first passing rank and publishes its path.
 static bool SearchCentroidWave(UClust &U, uint Query, const vector<uint> &Ranked,
@@ -80,15 +102,7 @@ static bool SearchCentroidWave(UClust &U, uint Query, const vector<uint> &Ranked
 			{
 			const string &Label = U.m_InputSeqs->GetLabelStr(Ranked[First+i]);
 			const Sequence &Y = GetGlobalInputSeqByLabel(Label);
-			const uint LY = Y.GetLength();
-			const size_t Cells = (size_t(LX) + 1)*(size_t(LY) + 1);
-			float *Fwd = Scratch.get() + i*Stride;
-			float *Rows = Fwd + Cells;
-			CalcRollingPostInPlace(X.GetBytePtr(), LX, Y.GetBytePtr(), LY, Fwd);
-			// Reuse the retired HMM insertion rows for the decoder's score rows.
-			char *TB = reinterpret_cast<char *>(Rows + (size_t(LY)+1)*FWD_INSERT_FLOATS_PER_COLUMN);
-			float Score = CalcAlnFlat(Fwd, LX, LY, Rows, TB, Paths[i]);
-			Scores[i] = Score/min(LX, LY);
+			Scores[i] = ScoreCentroid(X, Y, Scratch.get() + i*Stride, Paths[i]);
 			}
 
 		for (int i = 0; i < N; ++i)
@@ -104,23 +118,137 @@ static bool SearchCentroidWave(UClust &U, uint Query, const vector<uint> &Ranked
 	Hit = UINT_MAX;
 	return true;
 	}
+
+// Pair scores and paths depend only on the two sequences. Rank candidates
+// against a read-only index in parallel, then publish queries in input order.
+class CentroidQueryBatch
+	{
+	struct Trial
+		{
+		vector<uint> Tried;
+		uint Hit;
+		string Path;
+		};
+
+	UClust &U;
+	const vector<uint> &Order;
+	const uint Limit;
+	vector<const Sequence *> Seqs;
+	vector<Trial> Trials;
+	uint Threads = 0;
+	uint Start = 0, End = 0, IndexSize = 0;
+	size_t Stride = 0, Bytes = 0;
+	float *Pages = nullptr;
+
+	void Prepare(uint First)
+		{
+		Start = First;
+		const uint Count = min(uint(Trials.size()), uint(Order.size())-First);
+		End = Start + Count;
+		IndexSize = SIZE(U.m_CentroidSeqIndexes);
+		// The word sorter uses MUSCLE's process-wide allocation accounting.
+		// Keep ranking on the caller and parallelize only the pair scoring.
+		for (uint j = 0; j < Count; ++j)
+			RankCentroids(U, Order[First+j], Limit, Trials[j].Tried);
+#pragma omp parallel for num_threads(Threads) schedule(dynamic, 1)
+		for (int j = 0; j < (int) Count; ++j)
+			{
+			const uint Q = Order[First+j];
+			Trial &T = Trials[j];
+			T.Hit = UINT_MAX;
+			float *Work = Pages + size_t(omp_get_thread_num())*Stride;
+			for (uint k = 0; k < T.Tried.size(); ++k)
+				{
+				const uint Target = T.Tried[k];
+				if (ScoreCentroid(*Seqs[Q], *Seqs[Target], Work, T.Path) >= U.m_MinEA)
+					{
+					T.Hit = Target;
+					T.Tried.resize(k+1);
+					break;
+					}
+				}
+			}
+		}
+
+public:
+	CentroidQueryBatch(UClust &Owner, const vector<uint> &Queries, uint MaxRejects)
+	  : U(Owner), Order(Queries), Limit(MaxRejects)
+		{
+		const uint Requested = GetRequestedThreadCount();
+		if (Requested < 2 || Order.size() < 2*size_t(Requested) || Mega::m_Loaded)
+			return;
+		uint Longest = 0;
+		Seqs.resize(Order.size());
+		for (uint i = 0; i < Seqs.size(); ++i)
+			{
+			Seqs[i] = &GetGlobalInputSeqByLabel(U.m_InputSeqs->GetLabelStr(i));
+			const uint L = Seqs[i]->GetLength();
+			if (L == 0)
+				return;
+			Longest = max(Longest, L);
+			}
+
+		const size_t Budget = (64u*1024*1024)/sizeof(float);
+		const uint64 Width = uint64(Longest)+1;
+		if (Width > Budget/Width)
+			return;
+		const size_t Cells = size_t(Width*Width);
+		Stride = Cells + size_t(Width)*FWD_INSERT_FLOATS_PER_COLUMN
+		  + (Cells+sizeof(float)-1)/sizeof(float);
+		Threads = min(Requested, uint(Budget/Stride));
+		if (Threads < 2)
+			return;
+		Trials.resize(2*size_t(Threads));
+		Bytes = Threads*Stride*sizeof(float);
+		void *p = mmap(nullptr, Bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+		if (p != MAP_FAILED)
+			Pages = static_cast<float *>(p);
+		}
+	CentroidQueryBatch(const CentroidQueryBatch &) = delete;
+	CentroidQueryBatch &operator=(const CentroidQueryBatch &) = delete;
+	~CentroidQueryBatch() { if (Pages) munmap(Pages, Bytes); }
+	bool Available() const { return Pages != nullptr; }
+
+	uint Search(uint k, string &Path)
+		{
+		if (k == End)
+			Prepare(k);
+		Trial &T = Trials[k-Start];
+		if (SIZE(U.m_CentroidSeqIndexes) == IndexSize)
+			{
+			Path.swap(T.Path);
+			return T.Hit;
+			}
+		// An earlier query added a centroid. Repeat the original k-mer
+		// ranking, including its ties and rejection limit. Never assume
+		// the old candidates kept their ranks.
+		const uint Q = Order[k];
+		vector<uint> Ranked;
+		RankCentroids(U, Q, Limit, Ranked);
+		for (uint Target : Ranked)
+			{
+			if (Target == T.Hit)
+				{
+				Path.swap(T.Path);
+				return Target;
+				}
+			if (find(T.Tried.begin(), T.Tried.end(), Target) == T.Tried.end() &&
+			  ScoreCentroid(*Seqs[Q], *Seqs[Target], Pages, Path) >= U.m_MinEA)
+				return Target;
+			}
+		return UINT_MAX;
+		}
+	};
+
 #endif
 
 uint UClust::Search(uint SeqIndex, string &Path)
 	{
-	const Sequence *Seq = m_InputSeqs->GetSequence(SeqIndex);
-	const byte *ByteSeq = Seq->GetBytePtr();
-	const uint L = Seq->GetLength();
-
 	vector<uint> TopSeqIndexes;
-	vector<uint> TopWordCounts;
-	m_US.SearchSeq(ByteSeq, L, TopSeqIndexes, TopWordCounts);
-	uint TopCount = SIZE(TopSeqIndexes);
-	asserta(SIZE(TopWordCounts) == TopCount);
+	RankCentroids(*this, SeqIndex, MAX_REJECTS, TopSeqIndexes);
+	const uint TopCount = SIZE(TopSeqIndexes);
 	if (TopCount == 0)
 		return UINT_MAX;
-	if (TopCount > MAX_REJECTS)
-		TopCount = MAX_REJECTS;
 	uint ThreadCount = GetRequestedThreadCount();
 
 	uint CentroidSeqIndex = UINT_MAX;
@@ -173,6 +301,9 @@ void UClust::Run(MultiSequence &InputSeqs, float MinEA)
 #endif
 	vector<uint> Order;
 	InputSeqs.GetLengthOrder(Order);
+#if MUSCLE_HMM_SIMD && defined(__linux__)
+	CentroidQueryBatch Batch(*this, Order, MAX_REJECTS);
+#endif
 	uint LastLength = UINT_MAX;
 	const float MinEE = (1 - m_MinEA);
 	for (uint k = 0; k < InputSeqCount; ++k)
@@ -192,7 +323,13 @@ void UClust::Run(MultiSequence &InputSeqs, float MinEA)
 		  InputSeqCount, MinEE, CentroidCount, MemberCount);
 
 		string &Path = m_SeqIndexToPath[SeqIndex];
-		uint RepSeqIndex = Search(SeqIndex, Path);
+		uint RepSeqIndex;
+#if MUSCLE_HMM_SIMD && defined(__linux__)
+		if (Batch.Available())
+			RepSeqIndex = Batch.Search(k, Path);
+		else
+#endif
+			RepSeqIndex = Search(SeqIndex, Path);
 		if (RepSeqIndex == UINT_MAX)
 			{
 			m_CentroidSeqIndexes.push_back(SeqIndex);
