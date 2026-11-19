@@ -8,21 +8,19 @@
 #include "sparseposttranspose.h"
 
 namespace {
-constexpr uint Lanes = 8, BridgeBlock = 12, TargetBlock = 8;
-constexpr size_t RowBudget = 16u*1024*1024;
+constexpr uint Lanes = 16, BridgeBlock = 4, TargetBlock = 12;
+constexpr uint MaxSeqLength = 1024;
+constexpr size_t RowBudget = 20u*1024*1024;
 constexpr size_t WorkerBudget = 2u*1024*1024;
 
-// One key represents a bridge sequence and a residue within that sequence.
-struct Term
-	{
-	uint Key;
-	float P;
-	};
+// Keys are offsets into the aligned block of left-hand vectors.
+static_assert(BridgeBlock*MaxSeqLength*Lanes <= uint32_t(UINT16_MAX)+1, "joined key exceeds 16 bits");
 
 struct JoinedRows
 	{
 	vector<uint> Offsets;
-	vector<Term> Terms;
+	vector<uint16_t> Keys;
+	vector<float> Values;
 
 	// Concatenate the sparse rows in bridge order. A key identifies one
 	// residue in this block, so no bridge-index lookup is needed in the sum.
@@ -43,7 +41,8 @@ struct JoinedRows
 			}
 		for (uint y = 0; y < LY; ++y)
 			Offsets[y+1] += Offsets[y];
-		Terms.resize(Offsets[LY]);
+		Keys.resize(Offsets[LY]);
+		Values.resize(Offsets[LY]);
 		for (uint y = 0; y < LY; ++y)
 			{
 			uint out = Offsets[y];
@@ -53,7 +52,10 @@ struct JoinedRows
 				if (!A)
 					continue;
 				for (uint k = A->m_Offsets[y]; k < A->m_Offsets[y+1]; ++k)
-					Terms[out++] = {Base[Z]+A->GetCol_Offset(k),A->GetProb_Offset(k)};
+					{
+					Keys[out] = uint16_t((Base[Z]+A->GetCol_Offset(k))*Lanes);
+					Values[out++] = A->GetProb_Offset(k);
+					}
 				}
 			}
 		}
@@ -103,30 +105,42 @@ struct PairTiles
 		for (uint g = Starts[Tile]; g < Starts[Tile+1]; ++g)
 			{
 			SumRow &G = Groups[g];
-			__m256 Sum = _mm256_loadu_ps(G.Sum);
+			// Two independent groups of eight residues share each right-hand
+			// probability. Each accumulator still visits the original term order.
+			__m256 Lower = _mm256_loadu_ps(G.Sum);
+			__m256 Upper = _mm256_loadu_ps(G.Sum+8);
 			for (uint k = Right.Offsets[G.Column]; k < Right.Offsets[G.Column+1]; ++k)
 				{
-				const Term &R = Right.Terms[k];
-				const __m256 Left = _mm256_loadu_ps(Weights+R.Key*Lanes);
-				Sum += Left*_mm256_set1_ps(R.P);
+				const float *Row = Weights+Right.Keys[k];
+				const __m256 Left = _mm256_load_ps(Row);
+				const __m256 Probability = _mm256_set1_ps(Right.Values[k]);
+				Lower += Left*Probability;
+				Upper += _mm256_load_ps(Row+8)*Probability;
 				// Retain the rounding of each scalar update, including its contraction mode.
-				asm("" : "+x"(Sum));
+				asm("" : "+x"(Lower), "+x"(Upper));
 				}
-			_mm256_storeu_ps(G.Sum,Sum);
+			_mm256_storeu_ps(G.Sum,Lower);
+			_mm256_storeu_ps(G.Sum+8,Upper);
 			}
 		}
 
 	void Finish(MySparseMx &Out, uint N)
 		{
 		const MySparseMx &XY = *Source;
-		float *Post = AllocPost(XY.m_LX,XY.m_LY);
+		// Reuse the destination storage, writing only the original sparse coordinates.
+		Out.AllocLX(XY.m_LX);
+		Out.AllocVec(XY.m_VecSize);
+		Out.m_LX = XY.m_LX;
+		Out.m_LY = XY.m_LY;
+		memcpy(Out.m_Offsets,XY.m_Offsets,(XY.m_LX+1)*sizeof(uint));
 		for (uint x = 0; x < XY.m_LX; ++x)
 			for (uint k = XY.m_Offsets[x]; k < XY.m_Offsets[x+1]; ++k)
-				Post[size_t(x)*XY.m_LY+XY.GetCol_Offset(k)] = Groups[Slots[k]].Sum[x%Lanes];
-		Out.UpdateFromPost(XY,Post,N);
+				{
+				Out.SetCol_Offset(k,XY.GetCol_Offset(k));
+				Out.SetProb_Offset(k,Groups[Slots[k]].Sum[x%Lanes]/N);
+				}
 		Out.m_X = XY.m_X;
 		Out.m_Y = XY.m_Y;
-		myfree(Post);
 		}
 	};
 
@@ -136,7 +150,7 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 	const uint N = M.GetSeqCount(), LX = M.GetSeqLength(X);
 	const uint Blocks = (N+BridgeBlock-1)/BridgeBlock;
 	// Dense or unusual inputs can use the existing pair kernel independently.
-	size_t Bytes = size_t(MaxKeys)*Lanes*sizeof(float);
+	size_t Bytes = (size_t(MaxKeys)*Lanes+7)*sizeof(float);
 	for (uint Y = Lo; Y < Hi; ++Y)
 		{
 		const MySparseMx &XY = M.GetSparsePost(M.GetPairIndex(X,Y));
@@ -150,7 +164,8 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 		Pairs[Y-Lo].Init(M.GetSparsePost(M.GetPairIndex(X,Y)));
 	// A lane belongs to one X residue. Missing entries have probability zero.
 	// Each lane visits bridges and residues in the scalar kernel's original order.
-	vector<float> Weights(size_t(MaxKeys)*Lanes,0.0f);
+	vector<float> Storage(size_t(MaxKeys)*Lanes+7,0.0f);
+	float *Weights = reinterpret_cast<float *>((uintptr_t(Storage.data())+31)&~uintptr_t(31));
 	for (uint b = 0; b < Blocks; ++b)
 		{
 		const uint Begin = b*BridgeBlock, End = min(Begin+BridgeBlock,N);
@@ -169,19 +184,19 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 				const MySparseMx *A = Left[Z-Begin];
 				if (!A)
 					continue;
-				float *Rows = Weights.data()+Base[Z]*Lanes;
+				float *Rows = Weights+Base[Z]*Lanes;
 				for (uint x = x0; x < x1; ++x)
 					for (uint k = A->m_Offsets[x]; k < A->m_Offsets[x+1]; ++k)
 						Rows[A->GetCol_Offset(k)*Lanes+x-x0] = A->GetProb_Offset(k);
 				}
 			for (uint Y = Lo; Y < Hi; ++Y)
-				Pairs[Y-Lo].Update(x0/Lanes,Right[(Y-Lo)*Blocks+b],Weights.data());
+				Pairs[Y-Lo].Update(x0/Lanes,Right[(Y-Lo)*Blocks+b],Weights);
 			for (uint Z = Begin; Z < End; ++Z)
 				{
 				const MySparseMx *A = Left[Z-Begin];
 				if (!A)
 					continue;
-				float *Rows = Weights.data()+Base[Z]*Lanes;
+				float *Rows = Weights+Base[Z]*Lanes;
 				for (uint x = x0; x < x1; ++x)
 					for (uint k = A->m_Offsets[x]; k < A->m_Offsets[x+1]; ++k)
 						Rows[A->GetCol_Offset(k)*Lanes+x-x0] = 0.0f;
@@ -207,10 +222,10 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 	for (uint p = 0; p < Pairs; ++p)
 		{
 		const MySparseMx &A = M.GetSparsePost(p);
-		if (!A.m_LX || !A.m_LY || A.m_LX > 1024 || A.m_LY > 1024)
+		if (!A.m_LX || !A.m_LY || A.m_LX > MaxSeqLength || A.m_LY > MaxSeqLength)
 			return false;
 		const auto &Pair = M.GetPair(p);
-		const uint64 Bytes = uint64(A.m_Offsets[A.m_LX])*sizeof(Term);
+		const uint64 Bytes = uint64(A.m_Offsets[A.m_LX])*(sizeof(uint16_t)+sizeof(float));
 		Need[Pair.first] += Bytes;
 		Need[Pair.second] += Bytes;
 		const MySparseMx *Out = (*M.m_ptrUpdatedSparsePosts)[p];
