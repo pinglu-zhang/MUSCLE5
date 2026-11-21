@@ -8,19 +8,23 @@
 #include "sparseposttranspose.h"
 
 namespace {
-constexpr uint Lanes = 16, BridgeBlock = 4, TargetBlock = 12;
+constexpr uint Lanes = 8, BridgeBlock = 24, TargetBlock = 16;
 constexpr uint MaxSeqLength = 1024;
-constexpr size_t RowBudget = 20u*1024*1024;
-constexpr size_t WorkerBudget = 2u*1024*1024;
+constexpr size_t RowBudget = 42u*1024*1024;
+constexpr size_t WorkerBudget = 4u*1024*1024;
 
 // Keys are offsets into the aligned block of left-hand vectors.
-static_assert(BridgeBlock*MaxSeqLength*Lanes <= uint32_t(UINT16_MAX)+1, "joined key exceeds 16 bits");
+static_assert(BridgeBlock*MaxSeqLength*Lanes <= uint64(UINT_MAX), "joined key exceeds offset range");
 
 struct JoinedRows
 	{
 	vector<uint> Offsets;
-	vector<uint16_t> Keys;
-	vector<float> Values;
+	struct Entry
+		{
+		uint Offset;
+		float Probability;
+		};
+	vector<Entry> Entries;
 
 	// Concatenate the sparse rows in bridge order. A key identifies one
 	// residue in this block, so no bridge-index lookup is needed in the sum.
@@ -41,8 +45,7 @@ struct JoinedRows
 			}
 		for (uint y = 0; y < LY; ++y)
 			Offsets[y+1] += Offsets[y];
-		Keys.resize(Offsets[LY]);
-		Values.resize(Offsets[LY]);
+		Entries.resize(Offsets[LY]);
 		for (uint y = 0; y < LY; ++y)
 			{
 			uint out = Offsets[y];
@@ -53,8 +56,7 @@ struct JoinedRows
 					continue;
 				for (uint k = A->m_Offsets[y]; k < A->m_Offsets[y+1]; ++k)
 					{
-					Keys[out] = uint16_t((Base[Z]+A->GetCol_Offset(k))*Lanes);
-					Values[out++] = A->GetProb_Offset(k);
+					Entries[out++] = {(Base[Z]+A->GetCol_Offset(k))*Lanes, A->GetProb_Offset(k)};
 					}
 				}
 			}
@@ -100,27 +102,52 @@ struct PairTiles
 		Starts[Tiles] = uint(Groups.size());
 		}
 
+
 	void Update(uint Tile, const JoinedRows &Right, const float *Weights)
 		{
+		const auto *Entries = Right.Entries.data();
 		for (uint g = Starts[Tile]; g < Starts[Tile+1]; ++g)
 			{
-			SumRow &G = Groups[g];
-			// Two independent groups of eight residues share each right-hand
-			// probability. Each accumulator still visits the original term order.
-			__m256 Lower = _mm256_loadu_ps(G.Sum);
-			__m256 Upper = _mm256_loadu_ps(G.Sum+8);
-			for (uint k = Right.Offsets[G.Column]; k < Right.Offsets[G.Column+1]; ++k)
+			auto &Group = Groups[g];
+			uint k = Right.Offsets[Group.Column];
+			const uint End = Right.Offsets[Group.Column+1];
+			__m256 Sum0 = _mm256_loadu_ps(Group.Sum);
+			auto Accumulate = [&](uint Index, __m256 Sum)
 				{
-				const float *Row = Weights+Right.Keys[k];
-				const __m256 Left = _mm256_load_ps(Row);
-				const __m256 Probability = _mm256_set1_ps(Right.Values[k]);
-				Lower += Left*Probability;
-				Upper += _mm256_load_ps(Row+8)*Probability;
-				// Retain the rounding of each scalar update, including its contraction mode.
-				asm("" : "+x"(Lower), "+x"(Upper));
+				const auto &Entry = Entries[Index];
+				return _mm256_fmadd_ps(_mm256_load_ps(Weights+Entry.Offset),
+				  _mm256_set1_ps(Entry.Probability), Sum);
+				};
+
+			// Independent partial sums hide FMA latency on long sparse rows.
+			// Every original term is included. The final tree regroups additions.
+			if (End-k >= 16)
+				{
+				__m256 Sum1 = _mm256_setzero_ps(), Sum2 = Sum1, Sum3 = Sum1;
+				__m256 Sum4 = Sum1, Sum5 = Sum1, Sum6 = Sum1, Sum7 = Sum1;
+				for (; End-k >= 8; k += 8)
+					{
+					Sum0 = Accumulate(k,   Sum0);
+					Sum1 = Accumulate(k+1, Sum1);
+					Sum2 = Accumulate(k+2, Sum2);
+					Sum3 = Accumulate(k+3, Sum3);
+					Sum4 = Accumulate(k+4, Sum4);
+					Sum5 = Accumulate(k+5, Sum5);
+					Sum6 = Accumulate(k+6, Sum6);
+					Sum7 = Accumulate(k+7, Sum7);
+					asm("" : "+x"(Sum0), "+x"(Sum1), "+x"(Sum2), "+x"(Sum3),
+					  "+x"(Sum4), "+x"(Sum5), "+x"(Sum6), "+x"(Sum7));
+					}
+				Sum0 = _mm256_add_ps(
+				  _mm256_add_ps(_mm256_add_ps(Sum0,Sum1), _mm256_add_ps(Sum2,Sum3)),
+				  _mm256_add_ps(_mm256_add_ps(Sum4,Sum5), _mm256_add_ps(Sum6,Sum7)));
 				}
-			_mm256_storeu_ps(G.Sum,Lower);
-			_mm256_storeu_ps(G.Sum+8,Upper);
+			for (; k < End; ++k)
+				{
+				Sum0 = Accumulate(k,Sum0);
+				asm("" : "+x"(Sum0));
+				}
+			_mm256_storeu_ps(Group.Sum,Sum0);
 			}
 		}
 
@@ -163,7 +190,7 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 	for (uint Y = Lo; Y < Hi; ++Y)
 		Pairs[Y-Lo].Init(M.GetSparsePost(M.GetPairIndex(X,Y)));
 	// A lane belongs to one X residue. Missing entries have probability zero.
-	// Each lane visits bridges and residues in the scalar kernel's original order.
+	// The lane mapping is reused across all target sequences in this block.
 	vector<float> Storage(size_t(MaxKeys)*Lanes+7,0.0f);
 	float *Weights = reinterpret_cast<float *>((uintptr_t(Storage.data())+31)&~uintptr_t(31));
 	for (uint b = 0; b < Blocks; ++b)
@@ -179,15 +206,26 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 		for (uint x0 = 0; x0 < LX; x0 += Lanes)
 			{
 			const uint x1 = min(x0+Lanes,LX);
+			uint Low[BridgeBlock], High[BridgeBlock];
 			for (uint Z = Begin; Z < End; ++Z)
 				{
 				const MySparseMx *A = Left[Z-Begin];
 				if (!A)
 					continue;
 				float *Rows = Weights+Base[Z]*Lanes;
+				uint ColLo = A->m_LY, ColEnd = 0;
 				for (uint x = x0; x < x1; ++x)
-					for (uint k = A->m_Offsets[x]; k < A->m_Offsets[x+1]; ++k)
+					{
+					const uint First = A->m_Offsets[x], End = A->m_Offsets[x+1];
+					if (First == End)
+						continue;
+					ColLo = min(ColLo,A->GetCol_Offset(First));
+					ColEnd = max(ColEnd,A->GetCol_Offset(End-1)+1);
+					for (uint k = First; k < End; ++k)
 						Rows[A->GetCol_Offset(k)*Lanes+x-x0] = A->GetProb_Offset(k);
+					}
+				Low[Z-Begin] = ColLo;
+				High[Z-Begin] = ColEnd;
 				}
 			for (uint Y = Lo; Y < Hi; ++Y)
 				Pairs[Y-Lo].Update(x0/Lanes,Right[(Y-Lo)*Blocks+b],Weights);
@@ -197,9 +235,17 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 				if (!A)
 					continue;
 				float *Rows = Weights+Base[Z]*Lanes;
-				for (uint x = x0; x < x1; ++x)
-					for (uint k = A->m_Offsets[x]; k < A->m_Offsets[x+1]; ++k)
-						Rows[A->GetCol_Offset(k)*Lanes+x-x0] = 0.0f;
+				const uint ColLo = Low[Z-Begin], ColEnd = High[Z-Begin];
+				if (ColEnd <= ColLo)
+					continue;
+				// A contiguous clear is cheaper for a compact span. Widely
+				// separated entries retain the sparse clear.
+				if (ColEnd-ColLo <= (A->m_Offsets[x1]-A->m_Offsets[x0])*2)
+					std::fill(Rows+ColLo*Lanes,Rows+ColEnd*Lanes,0.0f);
+				else
+					for (uint x = x0; x < x1; ++x)
+						for (uint k = A->m_Offsets[x]; k < A->m_Offsets[x+1]; ++k)
+							Rows[A->GetCol_Offset(k)*Lanes+x-x0] = 0.0f;
 				}
 			}
 		}
@@ -212,20 +258,21 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 	try
 	{
 	const uint N = M.GetSeqCount(), Pairs = uint(M.m_Pairs.size());
-	if (Threads < 2 || N < 48 || N > 512 || omp_in_parallel())
+	if (Threads < 2 || N < 48 || N > 1024 || omp_in_parallel())
 		return false;
 	const uint Blocks = (N+BridgeBlock-1)/BridgeBlock;
 	vector<uint64> Need(N);
 	for (uint Y = 0; Y < N; ++Y)
 		Need[Y] = uint64(Blocks)*(M.GetSeqLength(Y)+1)*sizeof(uint);
-	uint64 Extra = 0;
+	uint64 Extra = 0, SparseBytes = 0;
 	for (uint p = 0; p < Pairs; ++p)
 		{
 		const MySparseMx &A = M.GetSparsePost(p);
 		if (!A.m_LX || !A.m_LY || A.m_LX > MaxSeqLength || A.m_LY > MaxSeqLength)
 			return false;
 		const auto &Pair = M.GetPair(p);
-		const uint64 Bytes = uint64(A.m_Offsets[A.m_LX])*(sizeof(uint16_t)+sizeof(float));
+		const uint64 Bytes = uint64(A.m_Offsets[A.m_LX])*sizeof(JoinedRows::Entry);
+		SparseBytes += 2*uint64(A.m_Offsets[A.m_LX])*(sizeof(float)+sizeof(uint));
 		Need[Pair.first] += Bytes;
 		Need[Pair.second] += Bytes;
 		const MySparseMx *Out = (*M.m_ptrUpdatedSparsePosts)[p];
@@ -233,7 +280,10 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 		if (A.m_LY > Capacity)
 			Extra += size_t(A.m_LY-Capacity)*sizeof(uint);
 		}
-	if (Extra > 4u*1024*1024)
+	// Adapt only the cap on row offsets to the already resident sparse matrices.
+	const uint64 OffsetCap = min(uint64(64u*1024*1024),
+	  max(uint64(16u*1024*1024),SparseBytes/50));
+	if (Extra > OffsetCap)
 		return false;
 
 	for (uint p = 0; p < Pairs; ++p)
