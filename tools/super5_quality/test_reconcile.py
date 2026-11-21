@@ -3,7 +3,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from reconcile_super5 import read_fasta, reconcile
-from refine import refine_file
+from refine import fully_ordered, refine_file
+from independent_columns import supported_columns
 
 
 class TestReconciliation(unittest.TestCase):
@@ -52,6 +53,36 @@ class TestReconciliation(unittest.TestCase):
     def test_pair_rule_with_computed_alternative(self):
         self.assertEqual(reconcile(self.base, self.alternate, [self.guide], self.output, "pair"), 1)
         self.assertEqual(read_fasta(self.output)[b"one label"], b"ABCdXYZ")
+
+    def test_order_certificate_can_span_rows(self):
+        self.assertTrue(fully_ordered({b"a": b"AB-", b"b": b"-BC"}))
+        self.assertFalse(fully_ordered({b"a": b"A-B", b"b": b".B-"}))
+        self.assertTrue(fully_ordered({b"a": b"X"}))
+
+    def test_unanimous_merge_checks_every_witness(self):
+        second = self.root / "witness.fa"
+        second.write_bytes(self.base.read_bytes())
+        stats = refine_file(self.base, self.guide, self.output, other_guides=[second])
+        self.assertEqual(stats["merges"], 0)
+        self.assertEqual(self.output.read_bytes(), self.base.read_bytes())
+        second.write_bytes(self.guide.read_bytes())
+        stats = refine_file(self.base, self.guide, self.output, other_guides=[second])
+        self.assertEqual(stats["new_pairs"], 1)
+        self.assertEqual(read_fasta(self.output)[b"one label"], b"ABCdXYZ")
+        with self.assertRaises(ValueError):
+            refine_file(self.base, self.guide, second, other_guides=[second])
+
+    def test_external_guide_skipped_and_raw_input_checked(self):
+        self.base.write_bytes(b">a label\nAB-\n>b\n-BC\n")
+        raw = self.root / "raw.fa"
+        raw.write_bytes(b">b\nBC\n>a label\nAB\n")
+        stats = supported_columns(self.base, self.output, source=raw)
+        self.assertEqual(stats["guides_computed"], 0)
+        self.assertEqual(self.output.read_bytes(), self.base.read_bytes())
+        raw.write_bytes(b">b\nXX\n>a label\nAB\n")
+        with self.assertRaises(ValueError):
+            supported_columns(self.base, self.output, source=raw)
+        self.assertEqual(self.output.read_bytes(), self.base.read_bytes())
 
 
 if __name__=="__main__": unittest.main()
