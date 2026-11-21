@@ -295,6 +295,26 @@ void HMMParams::CmdLineUpdate()
 	Normalize();
 	}
 
+static float SumInsertProbabilities(const vector<float> &Row)
+	{
+	// Match the v5.3 Linux reduction: eight lanes, then a horizontal sum,
+	// then the remaining residues in order. Keep each float rounding even
+	// with -ffast-math; this runs once per alphabet letter during setup.
+	const size_t Lanes = 8;
+	const size_t End = Row.size() - Row.size()%Lanes;
+	volatile float Partial[Lanes] = {};
+	for (size_t j = 0; j < End; j += Lanes)
+		for (size_t k = 0; k < Lanes; ++k)
+			Partial[k] = Partial[k] + Row[j+k];
+	for (size_t Stride = Lanes/2; Stride > 0; Stride /= 2)
+		for (size_t k = 0; k < Stride; ++k)
+			Partial[k] = Partial[k] + Partial[k+Stride];
+	volatile float Sum = Partial[0];
+	for (size_t j = End; j < Row.size(); ++j)
+		Sum = Sum + Row[j];
+	return Sum;
+	}
+
 void HMMParams::ToPairHMM() const
 	{
 	HMMParams Scores;
@@ -312,12 +332,7 @@ void HMMParams::ToPairHMM() const
 	vector<float> InsertScores;
 	for (uint i = 0; i < AlphaSize; ++i)
 		{
-		float MarginalProb = 0;
-		for (uint j = 0; j < AlphaSize; ++j)
-			{
-			float P = Probs.m_Emits[i][j];
-			MarginalProb += P;
-			}
+		const float MarginalProb = SumInsertProbabilities(Probs.m_Emits[i]);
 
 		float Score = log(MarginalProb);
 		InsertScores.push_back(Score);

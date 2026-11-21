@@ -1,8 +1,13 @@
 #include "muscle.h"
 #include "best3.h"
+#include "alnrowavx2.h"
 
 float CalcAlnScoreFlat(const float *Post, uint LX, uint LY, float *DPRows)
 	{
+#ifdef __AVX2__
+	if (LY >= 8)
+		return alnrow::Score<false>(Post, LX, LY, DPRows, nullptr);
+#endif
 	float *Row = DPRows;
 	for (uint j = 0; j <= LY; ++j)
 		Row[j] = 0;

@@ -1,5 +1,6 @@
 #include "muscle.h"
 #include "best3.h"
+#include "alnrowavx2.h"
 
 void TraceBackFlat(const char *TB, uint LX, uint LY, string &Path);
 
@@ -7,6 +8,14 @@ float CalcAlnFlat(const float *Post, uint LX, uint LY,
   float *DPRows, char *TB, string &Path)
 	{
 	Path.clear();
+#ifdef __AVX2__
+	if (LY >= 8)
+		{
+		const float Score = alnrow::Score<true>(Post, LX, LY, DPRows, TB);
+		TraceBackFlat(TB, LX, LY, Path);
+		return Score;
+		}
+#endif
 
 	float *OldRow = DPRows;
 	float *NewRow = DPRows + (LY+1);
