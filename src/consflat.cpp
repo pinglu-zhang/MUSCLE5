@@ -16,6 +16,94 @@ constexpr size_t WorkerBudget = 4u*1024*1024;
 // Keys are offsets into the aligned block of left-hand vectors.
 static_assert(BridgeBlock*MaxSeqLength*Lanes <= uint64(UINT_MAX), "joined key exceeds offset range");
 
+// Pool very similar bridge sequences in ordinary protein alignments.
+// All endpoint pairs and their sparse output coordinates are still evaluated.
+struct BridgePlan
+	{
+	vector<uint> Weight, Mate, Active;
+
+	BridgePlan(const MPCFlat &M, uint Iter)
+		{
+		const uint N = M.GetSeqCount();
+		Weight.assign(N, 1);
+		Mate.assign(N, UINT_MAX);
+		if (optset_align && g_Alpha == ALPHA_Amino && !optset_hmmin &&
+		  (!optset_perturb || opt_perturb == 0) && N >= 128)
+			{
+			struct Edge { uint A,B; float Score; };
+			vector<Edge> Edges;
+			for (uint a = 0; a < N; ++a)
+				for (uint b = a+1; b < N; ++b)
+					if (M.m_DistMx[a][b] >= 0.80f)
+						Edges.push_back({a,b,M.m_DistMx[a][b]});
+			std::sort(Edges.begin(),Edges.end(),[](const Edge &u,const Edge &v)
+				{
+				if (u.Score != v.Score) return u.Score > v.Score;
+				if (u.A != v.A) return u.A < v.A;
+				return u.B < v.B;
+				});
+			for (const Edge &e : Edges)
+				{
+				if (Mate[e.A] != UINT_MAX || Mate[e.B] != UINT_MAX) continue;
+				Mate[e.A] = e.B;
+				Mate[e.B] = e.A;
+				Weight[e.A] = Iter%2 ? 0 : 2;
+				Weight[e.B] = 2 - Weight[e.A];
+				}
+			}
+		for (uint z = 0; z < N; ++z)
+			if (Weight[z]) Active.push_back(z);
+		}
+
+	uint Count(uint x,uint y,uint z) const
+		{
+		if (z == Mate[x] || z == Mate[y]) return 1;
+		return Weight[z];
+		}
+	};
+
+// Original matrices remain read-only throughout the pass.
+static const MySparseMx &RowsEndingIn(MPCFlat &M,uint seq,uint z,MySparseMx &T)
+	{
+	const auto &A=M.GetSparsePost(M.GetPairIndex(min(seq,z),max(seq,z)));
+	if (seq < z) return A;
+	ReserveSparseRows(T,A.m_LY);
+	T.AllocVec(A.m_Offsets[A.m_LX]);
+	TransposeSparsePost(A,T);
+	return T;
+	}
+
+static void PooledPair(MPCFlat &M,uint p,const BridgePlan &Plan)
+	{
+	if (Plan.Active.size()==Plan.Weight.size()) { M.ConsPair(p); return; }
+	const auto &pair=M.GetPair(p);
+	const uint X=pair.first,Y=pair.second,N=M.GetSeqCount();
+	const MySparseMx &XY=M.GetSparsePost(p);
+	vector<float> Post(size_t(XY.m_LX)*XY.m_LY);
+	XY.ToPost(Post.data());
+	for (float &a:Post) a*=2;
+	MySparseMx T;
+	for (uint z=0;z<N;++z)
+		{
+		const uint weight=Plan.Count(X,Y,z);
+		if (z==X || z==Y || !weight) continue;
+		const auto &A=M.GetSparsePost(M.GetPairIndex(min(X,z),max(X,z)));
+		const auto &B=M.GetSparsePost(M.GetPairIndex(min(Y,z),max(Y,z)));
+		if (z<X) RelaxFlat_ZX_ZY(A,B,float(weight),Post.data());
+		else if (z<Y) RelaxFlat_XZ_ZY(A,B,float(weight),Post.data());
+		else
+			{
+			ReserveSparseRows(T,B.m_LY);
+			T.AllocVec(B.m_Offsets[B.m_LX]);
+			TransposeSparsePost(B,T);
+			RelaxFlat_XZ_ZY(A,T,float(weight),Post.data());
+			}
+		}
+	auto &Out=M.GetUpdatedSparsePost(p);
+	Out.UpdateFromPost(XY,Post.data(),N);
+	Out.m_X=XY.m_X; Out.m_Y=XY.m_Y;
+	}
+
 struct JoinedRows
 	{
 	vector<uint> Offsets;
@@ -28,18 +116,19 @@ struct JoinedRows
 
 	// Concatenate the sparse rows in bridge order. A key identifies one
 	// residue in this block, so no bridge-index lookup is needed in the sum.
-	void Build(MPCFlat &M, uint Y, uint Begin, uint End, const vector<uint> &Base)
+	void Build(MPCFlat &M, uint Y, uint Begin, uint End, const vector<uint> &Base, const BridgePlan &Plan)
 		{
 		const uint LY = M.GetSeqLength(Y);
 		Offsets.assign(LY+1,0);
 		const MySparseMx *Matrices[BridgeBlock] = {};
-		for (uint Z = Begin; Z < End; ++Z)
+		for (uint j=Begin; j<End; ++j)
 			{
+			const uint Z=Plan.Active[j];
 			if (Z == Y)
 				continue;
 			const MySparseMx &A = Z < Y ? M.GetUpdatedSparsePost(M.GetPairIndex(Z,Y))
 			  : M.GetSparsePost(M.GetPairIndex(Y,Z));
-			Matrices[Z-Begin] = &A;
+			Matrices[j-Begin] = &A;
 			for (uint y = 0; y < LY; ++y)
 				Offsets[y+1] += A.m_Offsets[y+1]-A.m_Offsets[y];
 			}
@@ -49,14 +138,15 @@ struct JoinedRows
 		for (uint y = 0; y < LY; ++y)
 			{
 			uint out = Offsets[y];
-			for (uint Z = Begin; Z < End; ++Z)
+			for (uint j=Begin; j<End; ++j)
 				{
-				const MySparseMx *A = Matrices[Z-Begin];
+				const uint Z=Plan.Active[j];
+				const MySparseMx *A = Matrices[j-Begin];
 				if (!A)
 					continue;
 				for (uint k = A->m_Offsets[y]; k < A->m_Offsets[y+1]; ++k)
 					{
-					Entries[out++] = {(Base[Z]+A->GetCol_Offset(k))*Lanes, A->GetProb_Offset(k)};
+					Entries[out++] = {(Base[Z]+A->GetCol_Offset(k))*Lanes, A->GetProb_Offset(k)*Plan.Weight[Z]};
 					}
 				}
 			}
@@ -151,6 +241,32 @@ struct PairTiles
 			}
 		}
 
+		// The mate of either endpoint contributes its own evidence exactly once.
+	// This also preserves the two identity contributions and denominator N.
+	void RestoreEndpointMate(MPCFlat &M,uint X,uint Y,uint Z,const BridgePlan &Plan)
+		{
+		if (Z==UINT_MAX || Z==X || Z==Y) return;
+		MySparseMx ta,tb;
+		const auto &A=RowsEndingIn(M,X,Z,ta);
+		const auto &B=RowsEndingIn(M,Y,Z,tb);
+		const auto &XY=*Source;
+		const float adjustment=1.0f-float(Plan.Weight[Z]);
+		for (uint x=0;x<XY.m_LX;++x)
+			for (uint k=XY.m_Offsets[x];k<XY.m_Offsets[x+1];++k)
+				{
+				const uint y=XY.GetCol_Offset(k);
+				uint i=A.m_Offsets[x],j=B.m_Offsets[y];
+				float contribution=0;
+				while (i<A.m_Offsets[x+1] && j<B.m_Offsets[y+1])
+					{
+					const uint a=A.GetCol_Offset(i),b=B.GetCol_Offset(j);
+					if (a<b) ++i;
+					else if (b<a) ++j;
+					else { contribution+=A.GetProb_Offset(i)*B.GetProb_Offset(j); ++i; ++j; }
+					}
+				Groups[Slots[k]].Sum[x%Lanes]+=adjustment*contribution;
+				}
+		}
 	void Finish(MySparseMx &Out, uint N)
 		{
 		const MySparseMx &XY = *Source;
@@ -172,10 +288,10 @@ struct PairTiles
 	};
 
 bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows> &Right,
-  const vector<uint> &Base, uint MaxKeys)
+  const vector<uint> &Base, uint MaxKeys, const BridgePlan &Plan)
 	{
 	const uint N = M.GetSeqCount(), LX = M.GetSeqLength(X);
-	const uint Blocks = (N+BridgeBlock-1)/BridgeBlock;
+	const uint Blocks = (uint(Plan.Active.size())+BridgeBlock-1)/BridgeBlock;
 	// Dense or unusual inputs can use the existing pair kernel independently.
 	size_t Bytes = (size_t(MaxKeys)*Lanes+7)*sizeof(float);
 	for (uint Y = Lo; Y < Hi; ++Y)
@@ -195,21 +311,23 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 	float *Weights = reinterpret_cast<float *>((uintptr_t(Storage.data())+31)&~uintptr_t(31));
 	for (uint b = 0; b < Blocks; ++b)
 		{
-		const uint Begin = b*BridgeBlock, End = min(Begin+BridgeBlock,N);
+		const uint Begin = b*BridgeBlock, End = min(Begin+BridgeBlock,uint(Plan.Active.size()));
 		const MySparseMx *Left[BridgeBlock] = {};
-		for (uint Z = Begin; Z < End; ++Z)
+		for (uint j=Begin; j<End; ++j)
 			{
+			const uint Z=Plan.Active[j];
 			if (Z != X)
-				Left[Z-Begin] = Z < X ? &M.GetUpdatedSparsePost(M.GetPairIndex(Z,X))
+				Left[j-Begin] = Z < X ? &M.GetUpdatedSparsePost(M.GetPairIndex(Z,X))
 				  : &M.GetSparsePost(M.GetPairIndex(X,Z));
 			}
 		for (uint x0 = 0; x0 < LX; x0 += Lanes)
 			{
 			const uint x1 = min(x0+Lanes,LX);
 			uint Low[BridgeBlock], High[BridgeBlock];
-			for (uint Z = Begin; Z < End; ++Z)
+			for (uint j=Begin; j<End; ++j)
 				{
-				const MySparseMx *A = Left[Z-Begin];
+				const uint Z=Plan.Active[j];
+				const MySparseMx *A = Left[j-Begin];
 				if (!A)
 					continue;
 				float *Rows = Weights+Base[Z]*Lanes;
@@ -224,18 +342,19 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 					for (uint k = First; k < End; ++k)
 						Rows[A->GetCol_Offset(k)*Lanes+x-x0] = A->GetProb_Offset(k);
 					}
-				Low[Z-Begin] = ColLo;
-				High[Z-Begin] = ColEnd;
+				Low[j-Begin] = ColLo;
+				High[j-Begin] = ColEnd;
 				}
 			for (uint Y = Lo; Y < Hi; ++Y)
 				Pairs[Y-Lo].Update(x0/Lanes,Right[(Y-Lo)*Blocks+b],Weights);
-			for (uint Z = Begin; Z < End; ++Z)
+			for (uint j=Begin; j<End; ++j)
 				{
-				const MySparseMx *A = Left[Z-Begin];
+				const uint Z=Plan.Active[j];
+				const MySparseMx *A = Left[j-Begin];
 				if (!A)
 					continue;
 				float *Rows = Weights+Base[Z]*Lanes;
-				const uint ColLo = Low[Z-Begin], ColEnd = High[Z-Begin];
+				const uint ColLo = Low[j-Begin], ColEnd = High[j-Begin];
 				if (ColEnd <= ColLo)
 					continue;
 				// A contiguous clear is cheaper for a compact span. Widely
@@ -250,7 +369,12 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 			}
 		}
 	for (uint Y = Lo; Y < Hi; ++Y)
-		Pairs[Y-Lo].Finish(M.GetUpdatedSparsePost(M.GetPairIndex(X,Y)),N);
+		{
+		auto &P=Pairs[Y-Lo];
+		P.RestoreEndpointMate(M,X,Y,Plan.Mate[X],Plan);
+		P.RestoreEndpointMate(M,X,Y,Plan.Mate[Y],Plan);
+		P.Finish(M.GetUpdatedSparsePost(M.GetPairIndex(X,Y)),N);
+		}
 	return true;
 	}
 
@@ -260,7 +384,8 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 	const uint N = M.GetSeqCount(), Pairs = uint(M.m_Pairs.size());
 	if (Threads < 2 || N < 48 || N > 1024 || omp_in_parallel())
 		return false;
-	const uint Blocks = (N+BridgeBlock-1)/BridgeBlock;
+	const BridgePlan Plan(M,Iter);
+	const uint Blocks = (uint(Plan.Active.size())+BridgeBlock-1)/BridgeBlock;
 	vector<uint64> Need(N);
 	for (uint Y = 0; Y < N; ++Y)
 		Need[Y] = uint64(Blocks)*(M.GetSeqLength(Y)+1)*sizeof(uint);
@@ -273,8 +398,8 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 		const auto &Pair = M.GetPair(p);
 		const uint64 Bytes = uint64(A.m_Offsets[A.m_LX])*sizeof(JoinedRows::Entry);
 		SparseBytes += 2*uint64(A.m_Offsets[A.m_LX])*(sizeof(float)+sizeof(uint));
-		Need[Pair.first] += Bytes;
-		Need[Pair.second] += Bytes;
+		if (Plan.Weight[Pair.second]) Need[Pair.first] += Bytes;
+		if (Plan.Weight[Pair.first]) Need[Pair.second] += Bytes;
 		const MySparseMx *Out = (*M.m_ptrUpdatedSparsePosts)[p];
 		const uint Capacity = max(A.m_LX, Out ? Out->m_MaxLX : 0u);
 		if (A.m_LY > Capacity)
@@ -304,9 +429,10 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 
 	vector<uint> Base(N);
 	uint Keys = 0, MaxKeys = 0;
-	for (uint Z = 0; Z < N; ++Z)
+	for (uint j=0; j<Plan.Active.size(); ++j)
 		{
-		if (Z%BridgeBlock == 0)
+		const uint Z=Plan.Active[j];
+		if (j%BridgeBlock == 0)
 			Keys = 0;
 		Base[Z] = Keys;
 		Keys += M.GetSeqLength(Z);
@@ -334,7 +460,7 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 				const uint b = j%Blocks;
 				try
 					{
-					Right[j].Build(M,Lo+j/Blocks,b*BridgeBlock,min((b+1)*BridgeBlock,N),Base);
+					Right[j].Build(M,Lo+j/Blocks,b*BridgeBlock,min((b+1)*BridgeBlock,uint(Plan.Active.size())),Base,Plan);
 					}
 				catch (const std::bad_alloc &)
 					{
@@ -349,7 +475,7 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 				{
 				try
 					{
-					if (UpdateTargets(M,x,Lo,Hi,Right,Base,MaxKeys))
+					if (UpdateTargets(M,x,Lo,Hi,Right,Base,MaxKeys,Plan))
 						continue;
 					}
 				catch (const std::bad_alloc &)
@@ -358,7 +484,7 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 					}
 				}
 			for (uint Y = Lo; Y < Hi; ++Y)
-				M.ConsPair(M.GetPairIndex(x,Y));
+				PooledPair(M,M.GetPairIndex(x,Y),Plan);
 			}
 		// Pairs inside a target block depend on one another's input orientation.
 		// Defer them and evaluate them together on the original active matrices.
@@ -371,7 +497,7 @@ bool UpdateConsistencyBlocks(MPCFlat &M, uint Threads, uint Iter)
 		}
 #pragma omp parallel for num_threads(Threads) schedule(dynamic,2)
 	for (int j = 0; j < int(Pending.size()); ++j)
-		M.ConsPair(Pending[j]);
+		PooledPair(M,Pending[j],Plan);
 	if (!Pending.empty())
 		ProgressStep(Pairs-1,Pairs,"Consistency (%u/%u)",Iter+1,M.m_ConsistencyIterCount);
 	return true;
