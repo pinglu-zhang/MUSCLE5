@@ -78,12 +78,16 @@ void USorter::AddSeq(const byte *Seq, uint L, uint SeqIndex)
 
 void USorter::SearchSeq(const byte *Seq, uint L, vector<uint> &TopSeqIndexes,
   vector<uint> &TopWordCounts)
+	{ SearchSeq(Seq,L,TopSeqIndexes,TopWordCounts,UINT_MAX); }
+
+void USorter::SearchSeq(const byte *Seq, uint L, vector<uint> &TopSeqIndexes,
+  vector<uint> &TopWordCounts,uint Limit)
 	{
 	TopSeqIndexes.clear();
 	TopWordCounts.clear();
 
 	uint IndexSize = SIZE(m_IndexSeqIndexes);
-	if (IndexSize == 0)
+	if (IndexSize == 0 || Limit == 0)
 		return;
 
 	if (L < m_WordLength)
@@ -105,14 +109,16 @@ void USorter::SearchSeq(const byte *Seq, uint L, vector<uint> &TopSeqIndexes,
 			}
 		}
 	uint *Order = myalloc(uint, IndexSize);
-	QuickSortOrderDesc(U.data(), IndexSize, Order);
+	const uint Count=min(IndexSize,Limit);
+	if (Count==IndexSize) QuickSortOrderDesc(U.data(),IndexSize,Order);
+	else RankPrefixDescending(U.data(),IndexSize,Count,Order);
 	uint TopSeqIndex = Order[0];
 	uint TopWordCount = U[TopSeqIndex];
 	uint MinU = TopWordCount/2 - 1;
 	if (MinU == 0)
 		MinU = 1;
 	uint LastWordCount = TopWordCount;
-	for (uint i = 0; i < IndexSize; ++i)
+	for (uint i = 0; i < Count; ++i)
 		{
 		uint Index = Order[i];
 		uint WordCount = U[Index];

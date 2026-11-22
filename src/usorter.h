@@ -17,4 +17,6 @@ public:
 	uint CharsToWord_Amino(const byte *Chars);
 	void SearchSeq(const byte *Seq, uint L,
 	  vector<uint> &TopSeqIndexes, vector<uint> &TopWordCounts);
+	void SearchSeq(const byte *Seq, uint L,
+	  vector<uint> &TopSeqIndexes, vector<uint> &TopWordCounts,uint Limit);
 	};

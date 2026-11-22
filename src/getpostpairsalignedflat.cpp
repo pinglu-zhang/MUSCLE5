@@ -1,5 +1,6 @@
 #include "muscle.h"
 #include "pprog.h"
+#include "hmmrolling.h"
 #include "locallock.h"
 
 float PProg::GetPostPairsAlignedFlat(const string &aProgressStr,
@@ -59,7 +60,7 @@ float PProg::GetPostPairsAlignedFlat(const string &aProgressStr,
 
 		//float *Fwd = AllocFB(L1, L2);
 		//float *Bwd = AllocFB(L1, L2);
-		float *Post = CalcPost(Label1, Label2);
+		float *Post = CalcProfilePost(Label1, Label2);
 
 		//CalcFwdFlat_PProg(GSI1, L1, GSI2, L2, Fwd);
 		//CalcBwdFlat_PProg(GSI1, L1, GSI2, L2, Bwd);

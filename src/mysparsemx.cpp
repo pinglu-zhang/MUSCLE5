@@ -1,5 +1,8 @@
 #include "myutils.h"
 #include "mysparsemx.h"
+#if defined(__AVX2__) && defined(__GNUC__)
+#include <immintrin.h>
+#endif
 
 void MySparseMx::AllocVec(uint Size)
 	{
@@ -136,9 +139,27 @@ void MySparseMx::FromPost(const float *Post, uint LX, uint LY)
 	Offset = 0;
 	for (uint i = 0; i < LX; ++i)
 		{
-		for (uint j = 0; j < LY; ++j)
+		uint j=0;
+#if defined(__AVX2__) && defined(__GNUC__)
+		const float *row=Post+size_t(i)*LY;
+		const __m256 cutoff=_mm256_set1_ps(MIN_SPARSE_PROB);
+		for (; LY-j>=8; j+=8)
 			{
-			float P = Post[i*LY + j];
+			const __m256 p=_mm256_loadu_ps(row+j);
+			unsigned keep=unsigned(_mm256_movemask_ps(_mm256_cmp_ps(p,cutoff,_CMP_GE_OQ)));
+			while (keep)
+				{
+				const uint col=j+unsigned(__builtin_ctz(keep));
+				SetProb_Offset(Offset,row[col]);
+				SetCol_Offset(Offset,col);
+				++Offset;
+				keep &= keep-1;
+				}
+			}
+#endif
+		for (; j < LY; ++j)
+			{
+			float P = Post[size_t(i)*LY + j];
 			if (P >= MIN_SPARSE_PROB)
 				{
 				float *ptr_P = (float *) (m_ValueVec + 8*Offset);

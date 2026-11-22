@@ -21,15 +21,17 @@ inline V logadd(V x, V y)
 	{
 	V hi = _mm256_max_ps(y,x), lo = _mm256_min_ps(x,y);
 	V delta = rounded(hi-lo);
-	V skip = _mm256_or_ps(_mm256_cmp_ps(delta,splat(LOG_UNDERFLOW_THRESHOLD),_CMP_GE_OQ),
-	  _mm256_cmp_ps(lo,splat(LOG_ZERO),_CMP_EQ_OQ));
+	// LOG_ZERO is -2e20f. A finite live partner is separated from it by
+	// more than the cutoff. With two sentinels, adding the d=0 correction
+	// rounds back to LOG_ZERO in binary32.
+	V skip = _mm256_cmp_ps(delta,splat(LOG_UNDERFLOW_THRESHOLD),_CMP_GE_OQ);
 	if (_mm256_movemask_ps(skip) == 255)
 		return hi;
 	V d = _mm256_min_ps(delta,splat(LOG_UNDERFLOW_THRESHOLD));
 	auto gt = [d](float edge) { return _mm256_castps_si256(_mm256_cmp_ps(d,splat(edge),_CMP_GT_OQ)); };
 	__m256i idx = _mm256_sub_epi32(_mm256_setzero_si256(),_mm256_add_epi32(gt(1),_mm256_add_epi32(gt(2.5f),gt(4.5f))));
 	auto coeff = [idx](float a,float b,float c,float e) {
-		return _mm256_permutevar8x32_ps(_mm256_setr_ps(a,b,c,e,a,b,c,e),idx); };
+		return _mm256_permutevar_ps(_mm256_setr_ps(a,b,c,e,a,b,c,e),idx); };
 	V p = coeff(-0.009350833524763f,-0.014532321752540f,-0.004605031767994f,-0.000458661602210f);
 	p = _mm256_fmadd_ps(p,d,coeff(0.130659527668286f,0.139942324101744f,0.063427417320019f,0.009695946122598f));
 	p = _mm256_fmadd_ps(p,d,coeff(0.498799810682272f,0.495635523139337f,0.695956496475118f,0.930734667215156f));
@@ -81,13 +83,19 @@ static void decode(float *out, const float *matches, int d,int ny,int lo,int hi,
 		}
 	}
 
-template<unsigned Capacity>
-static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
+template<unsigned Capacity, int Radius = 0>
+static bool calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
   Workspace<Capacity> &work)
 	{
 #include "hmmscores.h"
 	const auto &e = work.emissions;
 	auto *old = &work.ring[0], *prev = &work.ring[1], *cur = &work.ring[2];
+	// Save the five forward scores on each artificial edge. A supported
+	// escape through any match or insertion state retries the full matrix.
+	float boundary[Radius ? 2*Capacity+1 : 1][2][States];
+	auto center = [nx,ny](int d) { return (d*ny+(nx+ny)/2)/(nx+ny); };
+	if (Radius)
+		std::fill_n(out,size_t(nx)*ny,0.0f);
 	zeroCell(*old,0);
 	zeroCell(*prev,0);
 	zeroCell(*prev,1);
@@ -95,7 +103,9 @@ static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
 	prev->s[IY][1]=tSI+InsScore[Y[0]]; prev->s[JY][1]=tSJ+InsScore[Y[0]];
 	for (int d=2;d<=nx+ny;++d)
 		{
-		int lo=max(1,d-nx), hi=min(ny,d-1);
+		const int mid = Radius ? center(d) : 0;
+		const int lo=Radius ? max(max(1,d-nx),mid-Radius) : max(1,d-nx);
+		const int hi=Radius ? min(min(ny,d-1),mid+Radius) : min(ny,d-1);
 		for (int j=lo;j<=hi;j+=8)
 			{
 			const int x=nx-(d-j), y=j-1;
@@ -113,17 +123,30 @@ static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
 			}
 		if (d==2) cur->s[M][1]=tSM+MatchScore[X[0]][Y[0]];
 		for (int j=lo;j<=hi;++j) out[(d-j-1)*ny+j-1]=cur->s[M][j];
-		if (d<=nx)
+		if (d<=nx && (!Radius || mid<=Radius))
 			{
 			zeroCell(*cur,0);
 			volatile float a=tII+InsScore[X[d-1]], b=tJJ+InsScore[X[d-1]];
 			cur->s[IX][0]=a+prev->s[IX][0]; cur->s[JX][0]=b+prev->s[JX][0];
 			}
-		if (d<=ny)
+		if (d<=ny && (!Radius || d<=mid+Radius))
 			{
 			zeroCell(*cur,d);
 			volatile float a=tII+InsScore[Y[d-1]], b=tJJ+InsScore[Y[d-1]];
 			cur->s[IY][d]=a+prev->s[IY][d-1]; cur->s[JY][d]=b+prev->s[JY][d-1];
+			}
+		if (Radius)
+			{
+			if (lo==mid-Radius)
+				{
+				zeroCell(*cur,lo-1);
+				for (int k=0; k<States; ++k) boundary[d][0][k]=cur->s[k][lo];
+				}
+			if (hi==mid+Radius)
+				{
+				zeroCell(*cur,hi+1);
+				for (int k=0; k<States; ++k) boundary[d][1][k]=cur->s[k][hi];
+				}
 			}
 		std::swap(old,prev); std::swap(prev,cur);
 		}
@@ -133,8 +156,10 @@ static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
 	float total=CalcTotalProbFlat(fend,bend,0,0);
 	for (int d=nx+ny;d>=2;--d)
 		{
-		const int lo=max(1,d-nx), hi=min(ny,d-1);
-		const int innerLo=max(1,d-nx+1), innerHi=min(ny-1,d-1);
+		const int mid = Radius ? center(d) : 0;
+		const int lo=Radius ? max(max(1,d-nx),mid-Radius) : max(1,d-nx);
+		const int hi=Radius ? min(min(ny,d-1),mid+Radius) : min(ny,d-1);
+		const int innerLo=max(lo,d-nx+1), innerHi=min(hi,ny-1);
 		for (int j=innerLo;j<=innerHi;j+=8)
 			{
 			const int x=nx-(d-j)-1,y=j;
@@ -156,32 +181,65 @@ static void calculate(const byte *X,int nx,const byte *Y,int ny,float *out,
 		else
 			{
 			int j=d-nx;
-			if (j>=1)
+			if (j>=lo && j<=hi)
 				{
 				float iy=prev->s[IY][j+1]+InsScore[Y[j]], jy=prev->s[JY][j+1]+InsScore[Y[j]];
 				zeroCell(*cur,j); cur->s[M][j]=LOG_ADD(tMI+iy,tMJ+jy);
 				cur->s[IY][j]=tII+iy; cur->s[JY][j]=tJJ+jy;
 				}
 			int i=d-ny;
-			if (i>=1)
+			if (i>=1 && hi==ny)
 				{
 				float ix=prev->s[IX][ny]+InsScore[X[i]], jx=prev->s[JX][ny]+InsScore[X[i]];
 				zeroCell(*cur,ny); cur->s[M][ny]=LOG_ADD(tMI+ix,tMJ+jx);
 				cur->s[IX][ny]=tII+ix; cur->s[JX][ny]=tJJ+jx;
 				}
 			}
+		if (Radius)
+			{
+			auto supported = [&](int side,int col)
+				{
+				for (int k=0; k<States; ++k)
+					if (boundary[d][side][k]+cur->s[k][col] >= total-18.0f)
+						return true;
+				return false;
+				};
+			if (lo==mid-Radius)
+				{
+				if (supported(0,lo)) return false;
+				zeroCell(*cur,lo-1);
+				}
+			if (hi==mid+Radius)
+				{
+				if (supported(1,hi)) return false;
+				zeroCell(*cur,hi+1);
+				}
+			}
 		decode(out,cur->s[M],d,ny,lo,hi,total);
 		std::swap(old,prev); std::swap(prev,cur);
 		}
+	return true;
 	}
 
-static void calculateShort(const byte *x, int nx, const byte *y, int ny, float *out)
+template<unsigned Capacity>
+static void calculateGuarded(const byte *x,int nx,const byte *y,int ny,float *out,
+  Workspace<Capacity> &work)
+	{
+	const int shorter=min(nx,ny), longer=max(nx,ny);
+	if (shorter>=160 && 5*shorter>=3*longer &&
+	  calculate<Capacity,48>(x,nx,y,ny,out,work))
+		return;
+	calculate<Capacity,0>(x,nx,y,ny,out,work);
+	}
+
+static void calculateShort(const byte *x, int nx, const byte *y, int ny, float *out,bool guarded)
 	{
 	Workspace<ShortLimit> work(x, nx, y, ny);
-	calculate(x, nx, y, ny, out, work);
+	if (guarded) calculateGuarded(x, nx, y, ny, out, work);
+	else calculate<ShortLimit,0>(x,nx,y,ny,out,work);
 	}
 
-static bool tryMedium(const byte *x, unsigned nx, const byte *y, unsigned ny, float *out)
+static bool tryMedium(const byte *x, unsigned nx, const byte *y, unsigned ny, float *out,bool guarded)
 	{
 	// Very narrow diagonals leave most SIMD lanes idle. Use the rolling
 	// implementation for these shapes and for pairs above the workspace cap.
@@ -193,7 +251,8 @@ static bool tryMedium(const byte *x, unsigned nx, const byte *y, unsigned ny, fl
 	  new (std::nothrow) Workspace<MediumLimit>(x, nx, y, ny));
 	if (!work)
 		return false;
-	calculate(x, nx, y, ny, out, *work);
+	if (guarded) calculateGuarded(x, nx, y, ny, out, *work);
+	else calculate<MediumLimit,0>(x,nx,y,ny,out,*work);
 	return true;
 	}
 } // namespace diagonal_hmm

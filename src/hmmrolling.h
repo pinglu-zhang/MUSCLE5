@@ -23,6 +23,8 @@ void CalcBwdPost(const byte *X, uint LX, const byte *Y, uint LY,
 void CalcBwdPostStrided(const byte *X, uint LX, const byte *Y, uint LY,
   const float *Fwd, const float *End, float Total, float *Work, float *Post, size_t PostStride);
 
+float *CalcProfilePost(const string &LabelX,const string &LabelY);
+
 // Uses (LX+1)*(LY+1) + (LY+1)*FWD_INSERT_FLOATS_PER_COLUMN floats.
 // The first LX*LY floats contain the dense posterior on return.
 void CalcRollingPostInPlace(const byte *X, uint LX, const byte *Y, uint LY,

@@ -36,7 +36,7 @@ static void RankCentroids(UClust &U, uint Query, uint Limit, vector<uint> &Ranke
 	uint L;
 	const byte *Seq = U.m_InputSeqs->GetByteSeq(Query, L);
 	vector<uint> Counts;
-	U.m_US.SearchSeq(Seq, L, Ranked, Counts);
+	U.m_US.SearchSeq(Seq, L, Ranked, Counts, Limit);
 	asserta(Ranked.size() == Counts.size());
 	if (Ranked.size() > Limit)
 		Ranked.resize(Limit);

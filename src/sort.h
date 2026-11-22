@@ -102,6 +102,47 @@ template<class T, bool Desc> void QuickSortOrderRecurse(const T *Values, int lef
 		QuickSortOrderRecurse<T, Desc>(Values, i, right, Order);
 	}
 
+// Partition in the same order as QuickSortOrderRecurse<T,true>. A partition
+// entirely to the right of the prefix cannot affect even the order of ties.
+template<class T>
+inline void RankPrefixDescending(const T *values, uint n, uint limit, uint *order)
+    {
+    if (!n || !limit)
+        return;
+    asserta(n < INT_MAX);
+    for (uint k=0; k<n; ++k)
+        order[k] = k;
+    int left=0, right=int(n)-1;
+    while (left < right)
+        {
+        int i=left, j=right;
+        const T pivot=values[order[(left+right)/2]];
+        while (i<=j)
+            {
+            while (values[order[i]]>pivot) ++i;
+            while (values[order[j]]<pivot) --j;
+            if (i<=j)
+                {
+                swap(order[i],order[j]);
+                ++i;
+                --j;
+                }
+            }
+        if (left < j)
+            {
+            if (j>=int(limit))
+                {
+                right=j;
+                continue;
+                }
+            QuickSortOrderRecurse<T,true>(values,left,j,order);
+            }
+        if (i>=int(limit))
+            break;
+        left=i;
+        }
+    }
+
 template<class T> void QuickSortInPlace(T *Values, unsigned N)
 	{
 	if (N == 0)
