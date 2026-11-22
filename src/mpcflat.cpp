@@ -1,3 +1,4 @@
+#include <limits>
 #include "muscle.h"
 #include "mpcflat.h"
 #include "tree.h"
@@ -248,16 +249,36 @@ void MPCFlat::CalcPosteriors()
 		}
 	}
 
+double RunMeasuredRefinement(MPCFlat &model,bool UseRowPosts,bool track);
+
 void MPCFlat::Refine()
 	{
 	const uint SeqCount = GetSeqCount();
 	if (SeqCount < 3)
 		return;
 	const bool UseRowPosts = PrepareRefinementPosts();
+	const bool watch=optset_align && !optset_super5 && !optset_refineiters && !optset_hmmin &&
+	  g_Alpha==ALPHA_Amino && (!optset_perturb || opt_perturb==0) && !opt(stratified) &&
+	  !opt(diversified) && !optset_replicates && SeqCount>=128 && UseRowPosts;
+	unsigned quiet=0;
 	for (uint Iter = 0; Iter < m_RefineIterCount; ++Iter)
 		{
 		ProgressStep(Iter, m_RefineIterCount, "Refining");
-		RefineIter(UseRowPosts);
+		if (!watch)
+			RefineIter(UseRowPosts);
+		else
+			{
+			const double gain=RunMeasuredRefinement(*this,UseRowPosts,true);
+			// Require successive random bipartitions to agree to within
+			// eight single-precision epsilons in the cross-profile objective.
+			quiet = gain<=8.0*std::numeric_limits<float>::epsilon() ? quiet+1 : 0;
+
+			if (Iter+1>=16 && quiet>=8)
+				{
+				ProgressLog("Refinement converged after %u splits\n",Iter+1);
+				break;
+				}
+			}
 		}
 	}
 

@@ -186,12 +186,34 @@ void MPCFlat::BuildRefinementPost(const MultiSequence &MSA1, const MultiSequence
 	// A worker owns complete output rows. Both sparse orientations expose
 	// those rows directly. Every cell sees the original (i,j) pair order.
 	const uint64 PairRows = uint64(N1)*N2*min(Cols1, Cols2);
-	const uint Stripes = min(PairRows >= 2000000 ? 8u : 4u, GetRequestedThreadCount());
+	const bool BalanceRows = N1 + N2 >= 128 && PairRows >= 2000000;
+	const uint Limit = BalanceRows ? 32u : (PairRows >= 2000000 ? 8u : 4u);
+	const uint Stripes = min(Limit, GetRequestedThreadCount());
+	vector<uint> Cuts(Stripes+1);
+	if (BalanceRows)
+		{
+		// Gappy profile columns vary greatly in cost. Count occupied residues
+		// before cutting the output into disjoint stripes; each cell still
+		// receives its contributions in the original sequence-pair order.
+		vector<uint64> Work(Cols1+1, 1);
+		Work[0] = 0;
+		for (const auto &Starts : RowStarts)
+			for (uint Offset : Starts)
+				++Work[Offset/Cols2+1];
+		for (uint r = 0; r < Cols1; ++r)
+			Work[r+1] += Work[r];
+		for (uint t = 1; t < Stripes; ++t)
+			Cuts[t] = uint(std::lower_bound(Work.begin(),Work.end(), Work.back()*t/Stripes)-Work.begin());
+		}
+	else
+		for (uint t = 1; t < Stripes; ++t)
+			Cuts[t] = uint(uint64(Cols1)*t/Stripes);
+	Cuts[Stripes] = Cols1;
 #pragma omp parallel for num_threads(Stripes) schedule(static)
 	for (int Stripe = 0; Stripe < int(Stripes); ++Stripe)
 		{
-		const uint Lo = uint(uint64(Cols1)*Stripe/Stripes);
-		const uint Hi = uint(uint64(Cols1)*(Stripe+1)/Stripes);
+		const uint Lo = Cuts[Stripe];
+		const uint Hi = Cuts[Stripe+1];
 		std::fill(Post + size_t(Lo)*Cols2, Post + size_t(Hi)*Cols2, 0.0f);
 		for (uint i = 0; i < N1; ++i)
 			{

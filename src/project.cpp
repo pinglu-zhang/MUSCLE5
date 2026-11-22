@@ -11,58 +11,46 @@ MultiSequence* MultiSequence::Project(const vector<uint> &SeqIndexes)
 	return Project(IndexSet);
 	}
 
-// Create new MSA from subset of sequences, deleting
-// all-blank columns
+// Create a projected MSA in input-index order, dropping exactly the columns
+// containing '-' in every selected row. Scan individual rows contiguously.
 MultiSequence* MultiSequence::Project(const set<int>& SeqIndexes)
 	{
-	MultiSequence* SubsetMSA = new MultiSequence;
-	vector<Sequence *> NewSeqs;
-	uint OldColCount = UINT_MAX;
-	for (set<int>::const_iterator p = SeqIndexes.begin();
-	  p != SeqIndexes.end(); ++p)
+	MultiSequence *out=new MultiSequence;
+	if (SeqIndexes.empty()) return out;
+	const uint cols=GetSequence(*SeqIndexes.begin())->GetLength();
+	vector<byte> keep(cols,0);
+	for (int i : SeqIndexes)
 		{
-		int OldSeqIndex = *p;
-		const Sequence *OldSeq = GetSequence(OldSeqIndex);
-		const string &Label = OldSeq->m_Label;
-		uint L = OldSeq->GetLength();
-		if (OldColCount == UINT_MAX)
-			OldColCount = L;
-		else
-			asserta(L == OldColCount);
-
-		Sequence *NewSeq = NewSequence(); 
-		NewSeq->m_Label = Label;
-		NewSeq->m_CharVec.reserve(L);
-		SubsetMSA->m_Seqs.push_back(NewSeq);
-		SubsetMSA->m_Owners.push_back(true);
+		const Sequence *s=GetSequence(i);
+		asserta(s->GetLength()==cols);
+		const char *letters=s->GetCharPtr();
+		for (uint c=0; c<cols; ++c)
+			keep[c] |= byte(letters[c]!='-');
 		}
-
-	uint NewSeqCount = SIZE(SeqIndexes);
-	vector<char> NewCol(NewSeqCount);
-	for (uint OldColIndex = 0; OldColIndex < OldColCount; ++OldColIndex)
+	// Coalesce adjacent kept columns once for all output rows.
+	vector<pair<uint,uint> > spans;
+	uint kept=0;
+	for (uint c=0; c<cols;)
 		{
-		bool AllGaps = true;
-		uint NewSeqIndex = 0;
-		for (set<int>::const_iterator p = SeqIndexes.begin();
-		  p != SeqIndexes.end(); ++p)
-			{
-			int OldSeqIndex = *p;
-			const Sequence *OldSeq = GetSequence(OldSeqIndex);
-			char c = OldSeq->GetChar(OldColIndex);
-			NewCol[NewSeqIndex++] = c;
-			if (c != '-')
-				AllGaps = false;
-			}
-		if (AllGaps)
-			continue;
-
-		for (uint NewSeqIndex = 0; NewSeqIndex < NewSeqCount; ++NewSeqIndex)
-			{
-			char c = NewCol[NewSeqIndex];
-			Sequence *NewSeq = (Sequence *) SubsetMSA->m_Seqs[NewSeqIndex];
-			NewSeq->m_CharVec.push_back(c);
-			}
+		if (!keep[c]) { ++c; continue; }
+		const uint first=c++;
+		while (c<cols && keep[c]) ++c;
+		spans.emplace_back(first,c-first);
+		kept+=c-first;
 		}
-
-	return SubsetMSA;
+	for (int i : SeqIndexes)
+		{
+		const Sequence *s=GetSequence(i);
+		Sequence *row=NewSequence();
+		row->m_Label=s->m_Label;
+		row->m_CharVec.resize(kept);
+		uint at=0;
+		for (const auto &span : spans)
+			{
+			memcpy(row->m_CharVec.data()+at,s->GetCharPtr()+span.first,span.second);
+			at+=span.second;
+			}
+		out->AddSequence(row,true);
+		}
+	return out;
 	}
