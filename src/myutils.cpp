@@ -2606,8 +2606,7 @@ void SeqToFasta(FILE *f, const byte *Seq, unsigned L, const char *Label)
 		unsigned To = From + ROWLEN;
 		if (To >= L)
 			To = L;
-		for (unsigned Pos = From; Pos < To; ++Pos)
-			fputc(Seq[Pos], f);
+		WriteStdioFile(f, Seq + From, To - From);
 		fputc('\n', f);
 		}
 	}

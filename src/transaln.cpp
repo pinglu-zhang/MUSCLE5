@@ -335,21 +335,15 @@ void TransAln::Init(const MultiSequence &MSA,
 		}
 
 	const uint FreshSeqCount = FreshSeqs.GetSeqCount();
+	m_TPaths1.resize(FreshSeqCount);
 	for (uint FreshIndex = 0; FreshIndex < FreshSeqCount; ++FreshIndex)
-		{
-		string Path1;
-		MakeTPath1(FreshIndex, Path1);
-		m_TPaths1.push_back(Path1);
-		}
+		MakeTPath1(FreshIndex, m_TPaths1[FreshIndex]);
 
 	SetMaxInserts();
 
+	m_TPaths2.resize(FreshSeqCount);
 	for (uint FreshIndex = 0; FreshIndex < FreshSeqCount; ++FreshIndex)
-		{
-		string Path2;
-		MakeTPath2(FreshIndex, Path2);
-		m_TPaths2.push_back(Path2);
-		}
+		MakeTPath2(FreshIndex, m_TPaths2[FreshIndex]);
 	MakeMPath(m_MPath);
 	}
 
@@ -359,16 +353,25 @@ void TransAln::SetMaxInserts()
 	asserta(SIZE(m_TPaths1) == FreshCount);
 	m_MSAColToMaxInserts.clear();
 	m_MSAColToMaxInserts.resize(m_MSAColCount+1, 0);
-	for (uint FreshIndex = 0; FreshIndex < FreshCount; ++FreshIndex)
+	for (const string &Path : m_TPaths1)
 		{
-		vector<uint> MSAColToInserts;
-		MakeMSAColToInserts(FreshIndex, MSAColToInserts);
-		asserta(SIZE(MSAColToInserts) == m_MSAColCount + 1);
-		for (uint MSACol = 0; MSACol <= m_MSAColCount; ++MSACol)
+		// Every other symbol consumes one backbone column. Only actual runs
+		// of I can change the maximum at a boundary.
+		size_t Inserts = 0;
+		size_t Start = Path.find('I');
+		while (Start != string::npos)
 			{
-			uint Ins = MSAColToInserts[MSACol];
-			m_MSAColToMaxInserts[MSACol] = max(Ins, m_MSAColToMaxInserts[MSACol]);
+			size_t End = Start+1;
+			while (End < Path.size() && Path[End] == 'I')
+				++End;
+			const size_t Col = Start - Inserts;
+			asserta(Col <= m_MSAColCount);
+			const uint Count = uint(End - Start);
+			m_MSAColToMaxInserts[Col] = max(m_MSAColToMaxInserts[Col], Count);
+			Inserts += Count;
+			Start = Path.find('I', End);
 			}
+		asserta(Path.size() - Inserts == m_MSAColCount);
 		}
 
 	m_ExtendedMSAColCount = 0;
@@ -417,58 +420,37 @@ void TransAln::MakeMSAColToInserts(uint FreshIndex,
 void TransAln::MakeTPath2(uint FreshIndex, string &Path2) const
 	{
 	Path2.clear();
+	Path2.reserve(m_ExtendedMSAColCount);
 	asserta(SIZE(m_MSAColToMaxInserts) == m_MSAColCount + 1);
-	const string &TPath1 = GetTPath1(FreshIndex);
+	const string &Path1 = GetTPath1(FreshIndex);
 	uint MSACol = 0;
-	vector<uint> MSAColToInserts;
-	MakeMSAColToInserts(FreshIndex, MSAColToInserts);
-	const uint n1 = SIZE(TPath1);
-
-	MSACol = 0;
-	for (uint i = 0; i < n1; ++i)
+	uint InsertCount = 0;
+	for (char c : Path1)
 		{
-		char c = TPath1[i];
+		if (c == 'I')
+			{
+			Path2 += c;
+			++InsertCount;
+			continue;
+			}
+
+		asserta(c == 'F' || c == 'G' || c == 'g');
+		asserta(MSACol < m_MSAColCount);
+		const uint MaxInserts = m_MSAColToMaxInserts[MSACol];
+		asserta(InsertCount <= MaxInserts);
+		// MakeMPath places all insertion slots before their backbone column.
+		if (InsertCount < MaxInserts)
+			Path2.append(MaxInserts - InsertCount, 'i');
 		Path2 += c;
-		if (c != 'I')
-			{
-			asserta(MSACol < m_MSAColCount);
-			uint InsertCount = MSAColToInserts[MSACol];
-			uint MaxInsertCount = m_MSAColToMaxInserts[MSACol];
-			asserta(InsertCount <= MaxInsertCount);
-			for (uint j = InsertCount; j < MaxInsertCount; ++j)
-				Path2 += 'i';
-			}
-
-		switch (c)
-			{
-		case 'F':
-		case 'G':
-		case 'g':
-			++MSACol;
-			break;
-
-		case 'I':
-			break;
-
-		default:
-			asserta(false);
-			}
+		++MSACol;
+		InsertCount = 0;
 		}
+
 	asserta(MSACol == m_MSAColCount);
-	uint InsertCount = MSAColToInserts[m_MSAColCount];
-	uint MaxInsertCount = m_MSAColToMaxInserts[m_MSAColCount];
-	asserta(InsertCount <= MaxInsertCount);
-	for (uint j = InsertCount; j < MaxInsertCount; ++j)
-		Path2 += 'i';
-
-	if (SIZE(Path2) != m_ExtendedMSAColCount)
-		{
-		LogMe();
-		Log("FreshIndex %u, MSAIndex %u, Path2=%s\n",
-		  FreshIndex, GetMSAIndex(FreshIndex), Path2.c_str());
-		Die("|Path2|=%u, m_ExtendedMSAColCount=%u",
-		  SIZE(Path2), m_ExtendedMSAColCount);
-		}
+	const uint TrailingMax = m_MSAColToMaxInserts[MSACol];
+	asserta(InsertCount <= TrailingMax);
+	Path2.append(TrailingMax - InsertCount, 'i');
+	asserta(SIZE(Path2) == m_ExtendedMSAColCount);
 	}
 
 void TransAln::LogTPath1Aln(uint FreshIndex) const
@@ -660,7 +642,7 @@ Sequence *TransAln::ExtendFreshSeq(uint FreshIndex) const
 	const string &FLabel = GetFreshLabel(FreshIndex);
 	uint MSACol = 0;
 	Sequence *FX = Sequence::NewSequence();
-	FX->InitData();
+	FX->m_CharVec.resize(ColCount, '-');
 	FX->m_Label = F.m_Label;
 	uint FPos = 0;
 	for (uint Col = 0; Col < ColCount; ++Col)
@@ -672,7 +654,7 @@ Sequence *TransAln::ExtendFreshSeq(uint FreshIndex) const
 		case 'I':
 			{
 			char f = Fb[FPos];
-			FX->AppendChar(f);
+			FX->m_CharVec[Col] = f;
 			++FPos;
 			break;
 			}
@@ -681,7 +663,6 @@ Sequence *TransAln::ExtendFreshSeq(uint FreshIndex) const
 		case 'g':
 		case 'i':
 			{
-			FX->AppendChar('-');
 			break;
 			}
 		
@@ -689,6 +670,7 @@ Sequence *TransAln::ExtendFreshSeq(uint FreshIndex) const
 			Die("Invalid char '%c' in TPath2", c);
 			}
 		}
+	asserta(FPos == F.GetLength());
 	asserta(FX->GetLength() == m_ExtendedMSAColCount);
 	return FX;
 	}
@@ -701,7 +683,7 @@ Sequence *TransAln::ExtendMSASeq(uint MSAIndex) const
 	const string &MLabel = GetMSALabel(MSAIndex);
 	uint MSACol = 0;
 	Sequence *MX = Sequence::NewSequence();
-	MX->InitData();
+	MX->m_CharVec.resize(ColCount, '-');
 	MX->m_Label = M.m_Label;
 	for (uint Col = 0; Col < ColCount; ++Col)
 		{
@@ -711,14 +693,13 @@ Sequence *TransAln::ExtendMSASeq(uint MSAIndex) const
 		case 'M':
 			{
 			char c = Mb[MSACol];
-			MX->AppendChar(c);
+			MX->m_CharVec[Col] = c;
 			++MSACol;
 			break;
 			}
 
 		case 'i':
 			{
-			MX->AppendChar('-');
 			break;
 			}
 
@@ -726,6 +707,7 @@ Sequence *TransAln::ExtendMSASeq(uint MSAIndex) const
 			Die("Invalid char '%c' in MPath", c);
 			}
 		}
+	asserta(MSACol == M.GetLength());
 	asserta(MX->GetLength() == m_ExtendedMSAColCount);
 	return MX;
 	}
