@@ -21,92 +21,10 @@ static_assert(BridgeBlock*MaxSeqLength*Lanes <= uint64(UINT_MAX), "joined key ex
 struct BridgePlan
 	{
 	vector<uint> Weight, Mate, Active;
-	float Step = 1.0f;
-	vector<uint> Owner;
-	vector<vector<uint>> Members;
-
-	// Select centers far apart under the existing HMM expected-accuracy
-	// similarity. Each assignment must clear the same similarity floor as
-	// ordinary bridge pairs; no reference alignment enters the selection.
-	void Cover(const MPCFlat &M, uint Iter)
-		{
-		const uint n=M.GetSeqCount(), budget=(n+3)/4;
-		vector<float> nearest(n, -1.0f);
-		vector<uint> centers;
-		Owner.assign(n, UINT_MAX);
-		Members.resize(n);
-		uint next=0;
-		for (;;)
-			{
-			centers.push_back(next);
-			Owner[next]=next;
-			Members[next].push_back(next);
-			uint far=UINT_MAX;
-			for (uint i=0;i<n;++i)
-				if (Owner[i]==UINT_MAX)
-					{
-					nearest[i]=max(nearest[i],M.m_DistMx[next][i]);
-					if (far==UINT_MAX || nearest[i]<nearest[far]) far=i;
-					}
-			if (far==UINT_MAX || (centers.size()>=budget && nearest[far]>=0.80f)) break;
-			next=far;
-			}
-		vector<uint> order;
-		for (uint i=0;i<n;++i) if (Owner[i]==UINT_MAX) order.push_back(i);
-		std::sort(order.begin(), order.end(), [&](uint a,uint b)
-			{ return nearest[a]!=nearest[b] ? nearest[a]>nearest[b] : a<b; });
-		for (uint i:order)
-			{
-			uint best=UINT_MAX;
-			for (uint c:centers)
-				if (Members[c].size()<8 && M.m_DistMx[c][i]>=0.80f &&
-				  (best==UINT_MAX || M.m_DistMx[c][i]>M.m_DistMx[best][i]))
-					best=c;
-			if (best==UINT_MAX) { best=i; centers.push_back(i); }
-			Owner[i]=best;
-			Members[best].push_back(i);
-			}
-		Weight.assign(n,0);
-		for (uint c:centers)
-			{
-			auto &g=Members[c];
-			// Rank alternate representatives by their mean similarity to the group.
-			vector<float> similarity(n,0.0f);
-			for (uint a:g) for (uint b:g)
-				if (a!=b) similarity[a]+=M.m_DistMx[a][b];
-			std::sort(g.begin(),g.end(),[&](uint a,uint b)
-				{ return similarity[a]!=similarity[b] ? similarity[a]>similarity[b] : a<b; });
-			std::rotate(g.begin(),g.begin()+Iter%g.size(),g.end());
-			Weight[g.front()]=uint(g.size());
-			}
-		for (uint i=0;i<n;++i) if (Weight[i]) Active.push_back(i);
-		}
-
-	uint AvailableRepresentative(uint group,uint x,uint y) const
-		{
-		for (uint z:Members[group]) if (z!=x && z!=y) return z;
-		return UINT_MAX;
-		}
 
 	BridgePlan(const MPCFlat &M, uint Iter)
 		{
 		const uint N = M.GetSeqCount();
-		if (optset_align && g_Alpha==ALPHA_Amino && !optset_hmmin &&
-		  (!optset_perturb || opt_perturb==0) && !opt(stratified) && !opt(diversified) &&
-		  !optset_replicates && !optset_consiters && Iter==1 && N>=128)
-			{
-			const BridgePlan first(M,0);
-			Cover(M,Iter);
-			uint64 firstSquares=0, secondSquares=0;
-			for (uint w:first.Weight) firstSquares+=uint64(w)*w;
-			for (uint w:Weight) secondSquares+=uint64(w)*w;
-			// Both plans have total weight N. Their Kish effective sample
-			// size ratio is therefore the inverse ratio of squared weights.
-			Step=float(min(1.0,double(firstSquares)/double(secondSquares)));
-			Progress("Bridge effective sample sizes: %.1f -> %.1f, step %.5f",
-			  double(N)*N/firstSquares,double(N)*N/secondSquares,double(Step));
-			return;
-			}
 		Weight.assign(N, 1);
 		Mate.assign(N, UINT_MAX);
 		if (optset_align && g_Alpha == ALPHA_Amino && !optset_hmmin &&
@@ -139,13 +57,6 @@ struct BridgePlan
 
 	uint Count(uint x,uint y,uint z) const
 		{
-		if (!Owner.empty())
-			{
-			const uint c=Owner[z];
-			if (c!=Owner[x] && c!=Owner[y]) return Weight[z];
-			return z==AvailableRepresentative(c,x,y) ?
-			  uint(Members[c].size())-uint(Owner[x]==c)-uint(Owner[y]==c) : 0;
-			}
 		if (z == Mate[x] || z == Mate[y]) return 1;
 		return Weight[z];
 		}
@@ -160,19 +71,6 @@ static const MySparseMx &RowsEndingIn(MPCFlat &M,uint seq,uint z,MySparseMx &T)
 	T.AllocVec(A.m_Offsets[A.m_LX]);
 	TransposeSparsePost(A,T);
 	return T;
-	}
-
-// Both passes retain the same coordinates in their original order.
-static void DampCover(const MySparseMx &input, MySparseMx &updated, float alpha)
-	{
-	if (alpha>=1.0f) return;
-	const uint used=input.m_Offsets[input.m_LX];
-	for (uint k=0;k<used;++k)
-		{
-		const float first=input.GetProb_Offset(k);
-		const float second=updated.GetProb_Offset(k);
-		updated.SetProb_Offset(k,first+alpha*(second-first));
-		}
 	}
 
 static void PooledPair(MPCFlat &M,uint p,const BridgePlan &Plan)
@@ -203,7 +101,6 @@ static void PooledPair(MPCFlat &M,uint p,const BridgePlan &Plan)
 		}
 	auto &Out=M.GetUpdatedSparsePost(p);
 	Out.UpdateFromPost(XY,Post.data(),N);
-	DampCover(XY,Out,Plan.Step);
 	Out.m_X=XY.m_X; Out.m_Y=XY.m_Y;
 	}
 
@@ -353,8 +250,7 @@ struct PairTiles
 		const auto &A=RowsEndingIn(M,X,Z,ta);
 		const auto &B=RowsEndingIn(M,Y,Z,tb);
 		const auto &XY=*Source;
-		const float adjustment=float(Plan.Count(X,Y,Z))-float(Plan.Weight[Z]);
-		if (adjustment==0) return;
+		const float adjustment=1.0f-float(Plan.Weight[Z]);
 		for (uint x=0;x<XY.m_LX;++x)
 			for (uint k=XY.m_Offsets[x];k<XY.m_Offsets[x+1];++k)
 				{
@@ -475,24 +371,9 @@ bool UpdateTargets(MPCFlat &M, uint X, uint Lo, uint Hi, const vector<JoinedRows
 	for (uint Y = Lo; Y < Hi; ++Y)
 		{
 		auto &P=Pairs[Y-Lo];
-		if (Plan.Owner.empty())
-			{
-			P.RestoreEndpointMate(M,X,Y,Plan.Mate[X],Plan);
-			P.RestoreEndpointMate(M,X,Y,Plan.Mate[Y],Plan);
-			}
-		else
-			{
-			for (uint endpoint : {X,Y})
-				{
-				const uint c=Plan.Owner[endpoint];
-				if (endpoint==Y && c==Plan.Owner[X]) continue;
-				const uint z=Plan.AvailableRepresentative(c,X,Y);
-				P.RestoreEndpointMate(M,X,Y,z,Plan);
-				}
-			}
-		MySparseMx &out=M.GetUpdatedSparsePost(M.GetPairIndex(X,Y));
-		P.Finish(out,N);
-		DampCover(*P.Source,out,Plan.Step);
+		P.RestoreEndpointMate(M,X,Y,Plan.Mate[X],Plan);
+		P.RestoreEndpointMate(M,X,Y,Plan.Mate[Y],Plan);
+		P.Finish(M.GetUpdatedSparsePost(M.GetPairIndex(X,Y)),N);
 		}
 	return true;
 	}
